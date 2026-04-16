@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="つかしん窓口精算">
+  <title>つかしん窓口精算</title>
+  <rect width="512" height="512" rx="96" fill="#0D9488"/>
+  <g fill="none" stroke="#FFFFFF" stroke-width="36" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M168 148 L256 276"/>
+    <path d="M344 148 L256 276"/>
+    <path d="M256 276 L256 388"/>
+    <path d="M176 304 L336 304"/>
+    <path d="M176 352 L336 352"/>
+  </g>
+</svg>

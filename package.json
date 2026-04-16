@@ -1,0 +1,17 @@
+{
+  "name": "tsukashin-reception-settlement",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Tennis Lounge Tsukashin front desk settlement tool — dev dependencies only. The app itself ships as static files to GitHub Pages and has no runtime Node dependency.",
+  "scripts": {
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@vitest/coverage-v8": "^4.1.4",
+    "jsdom": "^29.0.2",
+    "sql.js": "^1.14.1",
+    "vitest": "^4.1.4"
+  }
+}

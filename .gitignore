@@ -1,0 +1,19 @@
+# Node / npm (Phase 10 test harness)
+node_modules/
+coverage/
+.vitest/
+
+# OS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Claude Code local tooling (hooks, rules, project map, personal allowlist)
+.claude/
+.agents/

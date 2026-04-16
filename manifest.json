@@ -1,0 +1,28 @@
+{
+  "name": "つかしん窓口精算",
+  "short_name": "窓口精算",
+  "description": "テニスラウンジつかしん 窓口精算ツール — 来館者の出席・精算・領収書発行を管理",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#F9FAFB",
+  "theme_color": "#0D9488",
+  "lang": "ja",
+  "dir": "ltr",
+  "categories": ["business", "productivity"],
+  "icons": [
+    {
+      "src": "icons/icon.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    },
+    {
+      "src": "icons/icon-maskable.svg",
+      "sizes": "any",
+      "type": "image/svg+xml",
+      "purpose": "maskable"
+    }
+  ]
+}

@@ -1,0 +1,410 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; font-src 'self'; connect-src 'self'; img-src 'self' blob:; object-src 'none'">
+  <meta name="description" content="テニスラウンジつかしん 窓口精算ツール — 来館者の出席・精算・領収書発行を管理するPWAアプリ">
+  <title>つかしん窓口精算</title>
+  <link rel="manifest" href="manifest.json">
+  <meta name="theme-color" content="#0D9488">
+  <link rel="icon" type="image/svg+xml" href="icons/icon.svg">
+  <link rel="apple-touch-icon" href="icons/icon.svg">
+  <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+  <!-- ========================================
+       画面1: 来館者一覧（メイン画面・デフォルト表示）
+       ======================================== -->
+  <div id="screen-visitor-list" class="screen screen--active">
+
+    <!-- ヘッダーバー -->
+    <header id="header-bar" class="header-bar">
+      <h1 class="header-bar__title">来館者一覧 <span id="visitor-count">(0名)</span></h1>
+      <div class="header-bar__stats">
+        <span class="header-bar__label">窓口総額</span>
+        <span id="header-total" class="header-bar__total">¥0</span>
+      </div>
+      <div class="header-bar__actions">
+        <button type="button" id="btn-sync" class="btn btn--header" title="SaaSデータを更新">更新</button>
+        <button type="button" id="btn-csv-export" class="btn btn--header" title="CSV出力">CSV</button>
+        <button type="button" id="btn-settings" class="btn btn--header btn--icon" title="データ管理" aria-label="データ管理">⚙</button>
+      </div>
+    </header>
+
+    <!-- 警告バナー領域（OPFS障害・タブ重複時に表示） -->
+    <div id="warning-banner" class="warning-banner" role="alert" aria-live="assertive" hidden>
+      <span class="warning-banner__icon">⚠</span>
+      <span id="warning-banner-message" class="warning-banner__message"></span>
+    </div>
+
+    <!-- 来館者テーブル -->
+    <main class="table-container">
+      <table id="visitor-table" class="data-table">
+        <thead>
+          <tr>
+            <th scope="col" class="col-id">ID</th>
+            <th scope="col" class="col-name">氏名</th>
+            <th scope="col" class="col-class">クラス</th>
+            <th scope="col" class="col-timeslot">時間枠</th>
+            <th scope="col" class="col-amount">窓口料金</th>
+            <th scope="col" class="col-breakdown">内訳</th>
+            <th scope="col" class="col-add">追加</th>
+            <th scope="col" class="col-memo">メモ</th>
+            <th scope="col" class="col-attendance">出席</th>
+            <th scope="col" class="col-received">受取</th>
+          </tr>
+        </thead>
+        <tbody id="visitor-table-body">
+          <!-- 来館者の行はJSで動的に生成 -->
+        </tbody>
+      </table>
+    </main>
+
+    <!-- フッターバー（検索・アクションボタン） -->
+    <footer id="footer-bar" class="footer-bar">
+      <div class="footer-bar__search">
+        <label for="search-input" class="sr-only">会員検索</label>
+        <input
+          type="text"
+          id="search-input"
+          class="input input--search"
+          placeholder="ID / 電話番号 / カタカナ名で検索"
+          autocomplete="off"
+        >
+        <!-- オートコンプリート候補はJSで動的に生成 -->
+        <div id="search-autocomplete" class="autocomplete-dropdown" role="listbox" hidden></div>
+      </div>
+      <div class="footer-bar__actions">
+        <button type="button" id="btn-detail" class="btn btn--primary" disabled>詳細 F2</button>
+        <button type="button" id="btn-delete" class="btn btn--outline btn--danger" disabled>削除</button>
+      </div>
+    </footer>
+  </div>
+
+
+  <!-- ========================================
+       画面2: 個人詳細
+       ======================================== -->
+  <div id="screen-individual-detail" class="screen">
+
+    <!-- 戻るバー -->
+    <header id="back-bar" class="back-bar">
+      <button type="button" id="btn-back" class="btn btn--outline">← 戻る (Esc)</button>
+    </header>
+
+    <!-- 日付セレクタ -->
+    <section class="detail-section">
+      <div class="date-range">
+        <label for="date-from">期間:</label>
+        <input type="date" id="date-from" class="input">
+        <span>～</span>
+        <input type="date" id="date-to" class="input">
+        <button type="button" id="btn-show-history" class="btn btn--outline">履歴を表示</button>
+      </div>
+    </section>
+
+    <!-- 会員情報ブロック -->
+    <section class="detail-section">
+      <div id="member-info" class="member-info-block">
+        <div class="member-info-block__field">
+          <span class="member-info-block__label">ID</span>
+          <span id="detail-member-id" class="member-info-block__value">—</span>
+        </div>
+        <div class="member-info-block__field">
+          <span class="member-info-block__label">氏名</span>
+          <span id="detail-member-name" class="member-info-block__value">—</span>
+        </div>
+        <div class="member-info-block__field">
+          <span class="member-info-block__label">TEL</span>
+          <span id="detail-member-phone" class="member-info-block__value">—</span>
+        </div>
+        <div class="member-info-block__field">
+          <span class="member-info-block__label">クラス</span>
+          <span id="detail-member-class" class="member-info-block__value">—</span>
+        </div>
+        <div class="member-info-block__field">
+          <span class="member-info-block__label">時間枠</span>
+          <span id="detail-member-timeslot" class="member-info-block__value">—</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- メモ -->
+    <section class="detail-section">
+      <label for="detail-memo" class="detail-section__label">メモ</label>
+      <textarea id="detail-memo" class="input input--textarea" rows="2" placeholder="会員メモ"></textarea>
+    </section>
+
+    <!-- 窓口料金セクション（本日分のみ、T7.1） -->
+    <section class="detail-section">
+      <h2 id="settlement-section-title" class="section-title">◆ 本日の窓口料金</h2>
+      <table id="settlement-table" class="data-table">
+        <thead>
+          <tr>
+            <th scope="col">日付</th>
+            <th scope="col">商品</th>
+            <th scope="col">名称</th>
+            <th scope="col">金額</th>
+            <th scope="col">数量</th>
+            <th scope="col">小計</th>
+            <th scope="col">決済</th>
+          </tr>
+        </thead>
+        <tbody id="settlement-table-body">
+          <!-- 精算明細はJSで動的に生成 -->
+        </tbody>
+      </table>
+      <div class="settlement-footer">
+        <span class="settlement-footer__total">合計: <strong id="settlement-total">¥0</strong> <small>(税込)</small></span>
+        <button type="button" id="btn-add-item" class="btn btn--primary">+ 追加</button>
+      </div>
+    </section>
+
+    <!-- 商品マスタ画面への導線（T7.2） -->
+    <section class="detail-section">
+      <div class="product-master-link">
+        <button type="button" id="btn-open-product-master" class="btn btn--primary">商品マスタ (F3)</button>
+        <span class="product-master-link__note">商品の新規作成・編集・無効化は専用画面で行います。</span>
+      </div>
+    </section>
+
+    <!-- 領収書発行 -->
+    <section class="detail-section">
+      <h2 class="section-title">◆ 領収書発行</h2>
+      <div class="receipt-section">
+        <div class="receipt-section__field">
+          <label for="receipt-recipient" class="receipt-section__label">宛名</label>
+          <input type="text" id="receipt-recipient" class="input" placeholder="宛名を入力">
+        </div>
+        <div class="receipt-section__field">
+          <label for="receipt-issuer" class="receipt-section__label">発行元</label>
+          <input type="text" id="receipt-issuer" class="input" value="テニスラウンジつかしん" readonly>
+        </div>
+        <button type="button" id="btn-issue-receipt" class="btn btn--accent" disabled>発行・印刷</button>
+      </div>
+      <!-- 最終発行履歴（T7.3） -->
+      <p id="receipt-last-issued" class="receipt-last-issued">発行履歴なし</p>
+    </section>
+  </div>
+
+
+  <!-- ========================================
+       画面3: 期間履歴（T7.1）
+       ======================================== -->
+  <div id="screen-period-history" class="screen">
+
+    <!-- 戻るバー -->
+    <header class="back-bar">
+      <button type="button" id="btn-back-history" class="btn btn--outline">← 戻る (Esc)</button>
+    </header>
+
+    <!-- 期間ラベル -->
+    <section class="detail-section">
+      <h2 id="history-section-title" class="section-title">◆ 窓口料金</h2>
+      <div class="history-range">
+        <span class="history-range__label">対象期間:</span>
+        <span id="history-range-value" class="history-range__value">—</span>
+      </div>
+    </section>
+
+    <!-- 期間内の明細テーブル（取引単位で1行表示） -->
+    <section class="detail-section">
+      <table id="history-table" class="data-table">
+        <thead>
+          <tr>
+            <th scope="col">日付</th>
+            <th scope="col">内訳</th>
+            <th scope="col">決済方法</th>
+            <th scope="col">合計</th>
+          </tr>
+        </thead>
+        <tbody id="history-table-body">
+          <!-- 履歴はJSで動的に生成（1取引=1行） -->
+        </tbody>
+      </table>
+      <div class="settlement-footer">
+        <span class="settlement-footer__total">期間合計: <strong id="history-total">¥0</strong> <small>(税込)</small></span>
+      </div>
+    </section>
+  </div>
+
+
+  <!-- ========================================
+       画面4: 商品マスタ（T7.2）
+       ======================================== -->
+  <div id="screen-product-master" class="screen">
+
+    <!-- 戻るバー -->
+    <header class="back-bar">
+      <button type="button" id="btn-back-product-master" class="btn btn--outline">← 戻る (Esc)</button>
+    </header>
+
+    <!-- 商品マスタ 新規作成 -->
+    <section class="detail-section">
+      <h2 class="section-title">◆ 商品マスタ 新規作成</h2>
+      <form id="product-form" class="product-form">
+        <div class="product-form__group">
+          <label for="product-code" class="product-form__label">番号</label>
+          <input type="text" id="product-code" class="input" placeholder="例: 001" required>
+        </div>
+        <div class="product-form__group">
+          <label for="product-name" class="product-form__label">名称</label>
+          <input type="text" id="product-name" class="input" placeholder="例: 体験レッスン" required>
+        </div>
+        <div class="product-form__group">
+          <label for="product-category" class="product-form__label">カテゴリ</label>
+          <input type="text" id="product-category" class="input" placeholder="例: レッスン" required>
+        </div>
+        <div class="product-form__group">
+          <label for="product-price" class="product-form__label">金額(税込)</label>
+          <input type="number" id="product-price" class="input" placeholder="例: 1100" min="0" required>
+        </div>
+        <button type="submit" id="btn-product-register" class="btn btn--accent">仮登録</button>
+      </form>
+    </section>
+
+    <!-- 商品マスタ 一覧・編集 -->
+    <section class="detail-section">
+      <h2 class="section-title">◆ 商品マスタ 一覧・編集</h2>
+      <table id="product-master-table" class="data-table">
+        <thead>
+          <tr>
+            <th scope="col">コード</th>
+            <th scope="col">名称</th>
+            <th scope="col">カテゴリ</th>
+            <th scope="col">金額(税込)</th>
+            <th scope="col">状態</th>
+          </tr>
+        </thead>
+        <tbody id="product-master-body">
+          <!-- 商品マスタはJSで動的に生成 -->
+        </tbody>
+      </table>
+    </section>
+  </div>
+
+  <!-- データ管理ダイアログ -->
+  <div id="data-mgmt-overlay" class="dialog-overlay" hidden>
+    <div class="dialog" role="dialog" aria-labelledby="data-mgmt-title">
+      <h2 id="data-mgmt-title" class="section-title section-title--compact">データ管理</h2>
+
+      <!-- API設定セクション（T6.12） -->
+      <h3 class="section-title section-title--compact api-settings__title">API設定</h3>
+      <p class="data-mgmt__description">
+        SaaS（HiTouch）との連携に使用します。未設定の場合はCSV手動インポートで運用できます。
+      </p>
+      <div class="api-settings">
+        <div class="api-settings__field">
+          <label for="api-endpoint-input" class="api-settings__label">APIエンドポイント</label>
+          <input type="url" id="api-endpoint-input" class="input" placeholder="https://..." autocomplete="off">
+        </div>
+        <div class="api-settings__field">
+          <label for="api-key-input" class="api-settings__label">APIキー</label>
+          <input type="password" id="api-key-input" class="input" placeholder="APIキーを入力" autocomplete="off">
+        </div>
+        <div class="api-settings__actions">
+          <button type="button" id="btn-api-save" class="btn btn--primary">保存</button>
+        </div>
+      </div>
+
+      <!-- DB バックアップ / 復元セクション -->
+      <h3 class="section-title section-title--compact api-settings__title">バックアップ</h3>
+      <p class="data-mgmt__description">
+        バックアップの取得と復元を行います。DBインポートは既存データを完全に上書きします。
+      </p>
+      <div class="data-mgmt__actions">
+        <button type="button" id="btn-db-export" class="btn btn--primary">DBエクスポート</button>
+        <button type="button" id="btn-db-import" class="btn btn--outline btn--danger">DBインポート</button>
+      </div>
+      <input type="file" id="db-import-file" accept=".sqlite,.db" hidden>
+      <div class="csv-export__actions">
+        <button type="button" id="btn-db-close" class="btn btn--outline">閉じる</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- CSV出力ダイアログ -->
+  <div id="csv-export-overlay" class="dialog-overlay" hidden>
+    <div class="dialog" role="dialog" aria-labelledby="csv-export-title">
+      <h2 id="csv-export-title" class="section-title section-title--compact">CSV出力</h2>
+      <fieldset class="csv-export__fieldset">
+        <legend class="csv-export__legend">期間</legend>
+        <label><input type="radio" name="csv-range" value="today" checked> 今日</label>
+        <label><input type="radio" name="csv-range" value="month"> 今月</label>
+        <label><input type="radio" name="csv-range" value="custom"> カスタム</label>
+        <div class="csv-export__custom" id="csv-export-custom" hidden>
+          <input type="date" id="csv-export-from" class="input">
+          <span>～</span>
+          <input type="date" id="csv-export-to" class="input">
+        </div>
+      </fieldset>
+      <fieldset class="csv-export__fieldset">
+        <legend class="csv-export__legend">エンコーディング</legend>
+        <label><input type="radio" name="csv-encoding" value="utf8" checked> UTF-8 (BOM付き)</label>
+        <label><input type="radio" name="csv-encoding" value="sjis"> Shift_JIS</label>
+      </fieldset>
+      <div class="csv-export__actions">
+        <button type="button" id="btn-csv-export-cancel" class="btn btn--outline">キャンセル</button>
+        <button type="button" id="btn-csv-export-run" class="btn btn--primary">出力</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- 汎用 確認ダイアログ（T6.10） -->
+  <div id="confirm-dialog-overlay" class="dialog-overlay" hidden>
+    <div class="dialog" role="alertdialog" aria-labelledby="confirm-dialog-title" aria-describedby="confirm-dialog-message" aria-modal="true">
+      <h2 id="confirm-dialog-title" class="section-title section-title--compact">確認</h2>
+      <p id="confirm-dialog-message" class="confirm-dialog__message"></p>
+      <div class="confirm-dialog__actions">
+        <button type="button" id="btn-confirm-dialog-cancel" class="btn btn--outline">キャンセル</button>
+        <button type="button" id="btn-confirm-dialog-execute" class="btn btn--accent">実行</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- CSV取り込み説明ダイアログ（T6.8） -->
+  <div id="sync-intro-overlay" class="dialog-overlay" hidden>
+    <div class="dialog" role="dialog" aria-labelledby="sync-intro-title" aria-modal="true">
+      <h2 id="sync-intro-title" class="section-title section-title--compact">CSVファイルの取り込み</h2>
+      <p class="sync-intro__lead">以下のいずれかのCSVファイルを選択してください。</p>
+      <ul class="sync-intro__list">
+        <li>会員マスタ</li>
+        <li>決済方法</li>
+        <li>予約リスト</li>
+      </ul>
+      <p class="sync-intro__note">※ファイルの種類は自動で判別されます。</p>
+      <div class="sync-intro__actions">
+        <button type="button" id="btn-sync-intro-cancel" class="btn btn--outline">キャンセル</button>
+        <button type="button" id="btn-sync-intro-proceed" class="btn btn--primary">ファイルを選択する</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- トースト通知領域 -->
+  <div id="toast-container" class="toast-container" aria-live="polite" role="status"></div>
+
+  <!-- 同期用の隠しファイル入力（T5.4） -->
+  <input type="file" id="sync-file-input" accept=".csv,text/csv" multiple hidden>
+
+  <!-- ベンダーライブラリ -->
+  <script src="lib/sql-wasm.js"></script>
+  <script src="lib/jspdf.umd.min.js"></script>
+  <script src="lib/encoding.min.js"></script>
+
+  <!-- アプリスクリプト -->
+  <script src="js/ui-helpers.js"></script>
+  <script src="js/db.js"></script>
+  <script src="js/repository.js"></script>
+  <script src="js/csv.js"></script>
+  <script src="js/confirm-dialog.js"></script>
+  <script src="js/visitor-list.js"></script>
+  <script src="js/individual-detail.js"></script>
+  <script src="js/product-master.js"></script>
+  <script src="js/receipt.js"></script>
+  <script src="js/data-management.js"></script>
+  <script src="js/sync.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>
