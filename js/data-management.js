@@ -132,6 +132,43 @@ async function saveApiSettings(endpoint, apiKey) {
 }
 
 // ============================================
+// ストレージ使用量表示（Phase 15 T15.2）
+// ============================================
+
+/**
+ * データ管理ダイアログのストレージセクションに使用量と永続化状態を表示する。
+ * Storage API 未対応ブラウザではフォールバックメッセージを表示する。
+ */
+async function updateStorageUsageDisplay() {
+  const textEl = document.getElementById('storage-usage-text');
+  const statusEl = document.getElementById('storage-persist-status');
+  if (!textEl) return;
+
+  if (!navigator.storage || typeof navigator.storage.estimate !== 'function') {
+    textEl.textContent = 'ストレージ情報を取得できません';
+    if (statusEl) statusEl.textContent = '';
+    return;
+  }
+
+  try {
+    const estimate = await navigator.storage.estimate();
+    const usageMB = ((estimate.usage || 0) / 1024 / 1024).toFixed(1);
+    const quotaGB = ((estimate.quota || 0) / 1024 / 1024 / 1024).toFixed(1);
+    textEl.textContent = `使用: ${usageMB} MB / 上限: ${quotaGB} GB`;
+
+    if (statusEl && typeof navigator.storage.persisted === 'function') {
+      const isPersisted = await navigator.storage.persisted();
+      statusEl.textContent = isPersisted ? '（永続化: 有効）' : '（永続化: 未設定）';
+      statusEl.classList.toggle('storage-usage__status--ok', isPersisted);
+    }
+  } catch (error) {
+    console.warn('ストレージ情報の取得に失敗:', error);
+    textEl.textContent = 'ストレージ情報を取得できませんでした';
+    if (statusEl) statusEl.textContent = '';
+  }
+}
+
+// ============================================
 // 設定ポップオーバー初期化
 // ============================================
 
@@ -153,9 +190,10 @@ function initDataManagement() {
 
   if (!btnSettings || !overlay || !btnExport || !btnImport || !btnClose || !fileInput) return;
 
-  /** ⚙ クリックで開く。開くたびに settings から API 設定を読み込んで入力欄に反映 */
+  /** ⚙ クリックで開く。開くたびに settings から API 設定を読み込み、ストレージ使用量を更新 */
   btnSettings.addEventListener('click', () => {
     loadApiSettingsIntoInputs(apiEndpointInput, apiKeyInput);
+    updateStorageUsageDisplay();
     overlay.hidden = false;
   });
 

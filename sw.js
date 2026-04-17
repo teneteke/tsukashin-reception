@@ -6,7 +6,7 @@
  */
 
 /** キャッシュ名（バージョン変更でキャッシュ更新） */
-const CACHE_NAME = 'tsukashin-v20';
+const CACHE_NAME = 'tsukashin-v21';
 
 /**
  * キャッシュ対象のアプリファイル一覧

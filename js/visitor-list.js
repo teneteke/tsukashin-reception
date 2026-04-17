@@ -26,6 +26,58 @@ const AUTOCOMPLETE_MAX_RESULTS = 10;
 const AUTOCOMPLETE_CLOSE_DELAY_MS = 200;
 
 // ============================================
+// Phase 15: 作業日状態管理
+// ============================================
+
+/** 現在の作業日（デフォルトは本日）。画面1の全操作がこの日付を対象とする。 */
+let currentWorkingDate = getTodayJST();
+
+/**
+ * 他モジュール（sync.js 等）が作業日を参照するためのゲッター
+ * @returns {string} YYYY-MM-DD
+ */
+function getWorkingDate() {
+  return currentWorkingDate;
+}
+
+/**
+ * ヘッダーの日付入力と「今日」ボタンを初期化する
+ */
+function initWorkingDatePicker() {
+  const dateInput = document.getElementById('working-date-input');
+  const btnToday = document.getElementById('btn-today');
+  if (!dateInput) return;
+
+  dateInput.value = currentWorkingDate;
+
+  dateInput.addEventListener('change', () => {
+    const newDate = dateInput.value;
+    if (!newDate) return;
+    currentWorkingDate = newDate;
+    updateDateInputAppearance(dateInput);
+    renderVisitorTable();
+  });
+
+  if (btnToday) {
+    btnToday.addEventListener('click', () => {
+      currentWorkingDate = getTodayJST();
+      dateInput.value = currentWorkingDate;
+      updateDateInputAppearance(dateInput);
+      renderVisitorTable();
+    });
+  }
+}
+
+/**
+ * 作業日が今日以外のとき、日付入力に警告スタイルを付与する
+ * @param {HTMLInputElement} dateInput
+ */
+function updateDateInputAppearance(dateInput) {
+  const isToday = currentWorkingDate === getTodayJST();
+  dateInput.classList.toggle('header-bar__date-input--past', !isToday);
+}
+
+// ============================================
 // T2.1 テーブル描画
 // ============================================
 
@@ -110,7 +162,7 @@ function renderVisitorTable() {
   const tableBody = document.getElementById('visitor-table-body');
   if (!tableBody) return;
 
-  const transactionsWithTotals = getTodayVisitorList();
+  const transactionsWithTotals = getTodayVisitorList(currentWorkingDate);
 
   /** Phase 9 T9.5: クラス／時間枠の DISTINCT リストは1度だけ取得してループ内で使い回す。
    *  旧実装は buildVisitorRowHtml → buildClassOptions → getDistinctClasses の連鎖を行ごとに
@@ -326,9 +378,9 @@ function selectAutocompleteItem() {
  * @param {string} memberId - 会員ID
  */
 async function addMemberToToday(memberId) {
-  const today = getTodayJST();
+  const today = currentWorkingDate;
 
-  /** 既に本日のリストにいるか確認 */
+  /** 既に作業日のリストにいるか確認 */
   if (hasTransactionForDate(today, memberId)) {
     /** 既存の行をフォーカス */
     const existingRow = document.querySelector(`#visitor-table-body tr[data-member-id="${CSS.escape(memberId)}"]`);
@@ -348,7 +400,7 @@ async function addMemberToToday(memberId) {
 
   try {
     /** transaction行を作成 */
-    await addMemberTransaction(memberId);
+    await addMemberTransaction(memberId, currentWorkingDate);
 
     /** テーブルを再描画 */
     renderVisitorTable();
@@ -367,7 +419,7 @@ async function addMemberToToday(memberId) {
  */
 async function addWalkIn(name) {
   try {
-    const walkInId = await createWalkInWithTransaction(name);
+    const walkInId = await createWalkInWithTransaction(name, currentWorkingDate);
 
     /** テーブルを再描画 */
     renderVisitorTable();
@@ -446,7 +498,7 @@ async function addItemToTransaction(txnId, product) {
       return;
     }
 
-    await addItemToMemberToday(memberId, { code: product.code, name: product.name, price: product.price });
+    await addItemToMemberToday(memberId, { code: product.code, name: product.name, price: product.price }, currentWorkingDate);
     console.log(`商品を追加しました: ${product.code} ${product.name} ${formatCurrency(product.price)}`);
   } catch (error) {
     console.error('商品の追加に失敗しました:', error);
@@ -759,6 +811,9 @@ function initVisitorListEvents() {
   if (btnDelete) {
     btnDelete.addEventListener('click', () => deleteSelectedVisitor());
   }
+
+  /** Phase 15: 作業日ピッカーの初期化 */
+  initWorkingDatePicker();
 
   /** 検索バーの初期化 */
   initSearch();

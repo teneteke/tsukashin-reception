@@ -261,6 +261,33 @@ button {
   white-space: nowrap;
 }
 
+.header-bar__date {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-2);
+}
+
+.header-bar__date-input {
+  font: var(--text-body);
+  color: var(--foreground);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: var(--sp-1) var(--sp-2);
+  height: var(--min-touch-target);
+  cursor: pointer;
+}
+
+.header-bar__date-input--past {
+  border-color: var(--warning);
+  background-color: rgba(245, 158, 11, 0.1);
+}
+
+.btn--today {
+  font-size: var(--text-small);
+  white-space: nowrap;
+}
+
 .header-bar__stats {
   display: flex;
   align-items: baseline;
@@ -1659,4 +1686,30 @@ button {
   display: flex;
   justify-content: flex-end;
   gap: var(--sp-2);
+}
+
+/* ==========================================================================
+ * Section 21: Phase 15 — ストレージ使用量表示
+ * ========================================================================== */
+
+.storage-usage {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: var(--sp-2) 0;
+}
+
+.storage-usage__text {
+  font: var(--text-body);
+  color: var(--foreground);
+  font-variant-numeric: tabular-nums;
+}
+
+.storage-usage__status {
+  font: var(--text-caption);
+  color: var(--foreground-secondary);
+}
+
+.storage-usage__status--ok {
+  color: var(--success);
 }

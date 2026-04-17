@@ -123,8 +123,8 @@ async function updateMemberMemo(memberId, memo) {
  * @param {string} name - 会員名
  * @returns {Promise<string>} 生成されたウォークインID
  */
-async function createWalkInWithTransaction(name) {
-  const today = getTodayJST();
+async function createWalkInWithTransaction(name, targetDate) {
+  const today = targetDate || getTodayJST();
   const now = getNowISO();
   const dateCompact = today.replace(/-/g, '');
   const prefix = `W-${dateCompact}-`;
@@ -163,8 +163,8 @@ async function createWalkInWithTransaction(name) {
  * items / lineTotal / payment_method_name を含む
  * @returns {Array<Object>}
  */
-function getTodayVisitorList() {
-  const today = getTodayJST();
+function getTodayVisitorList(targetDate) {
+  const today = targetDate || getTodayJST();
 
   /** メインクエリ: transactions + members + items + payment_methods を一括JOIN */
   const rows = dbQuery(`
@@ -274,8 +274,8 @@ function getDateReservationsWithProtectionFlags(date) {
  * @param {string} memberId
  * @returns {Promise<void>}
  */
-async function addMemberTransaction(memberId) {
-  const today = getTodayJST();
+async function addMemberTransaction(memberId, targetDate) {
+  const today = targetDate || getTodayJST();
   const now = getNowISO();
   const name = getMemberName(memberId);
   await dbRun(`
@@ -470,8 +470,8 @@ function getSettlementTotal(memberId, dateFrom, dateTo) {
  * @param {Object} product - { code, name, price }
  * @returns {Promise<void>}
  */
-async function addItemToMemberToday(memberId, product) {
-  const today = getTodayJST();
+async function addItemToMemberToday(memberId, product, targetDate) {
+  const today = targetDate || getTodayJST();
   const now = getNowISO();
 
   /** Phase 9 T9.9: 最大4回の dbRun（INSERT transaction / 再SELECT / INSERT or UPDATE item）を

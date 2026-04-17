@@ -389,6 +389,18 @@ async function initApp() {
     return;
   }
 
+  /** Phase 15 T15.1: OPFS 永続化保証
+   *  ブラウザにストレージ自動削除の対象外にするよう要求する。
+   *  Chrome ではほぼ自動で許可される。API 未対応ブラウザでは何もしない。 */
+  if (navigator.storage && typeof navigator.storage.persist === 'function') {
+    try {
+      const granted = await navigator.storage.persist();
+      console.log('OPFS 永続化ストレージ:', granted ? '許可' : '拒否（best-effort 維持）');
+    } catch (persistError) {
+      console.warn('永続化リクエストに失敗しました:', persistError);
+    }
+  }
+
   /** DB初期化成功後にDB依存のイベントリスナーを設定 */
 
   /** 画面1の対話系リスナー（[+] / 出席 / 受取 / インラインselect / メモ / 削除 / 検索 / 更新） */

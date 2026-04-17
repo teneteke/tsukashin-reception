@@ -22,6 +22,10 @@
     <!-- ヘッダーバー -->
     <header id="header-bar" class="header-bar">
       <h1 class="header-bar__title">来館者一覧 <span id="visitor-count">(0名)</span></h1>
+      <div class="header-bar__date">
+        <input type="date" id="working-date-input" class="header-bar__date-input" title="作業日">
+        <button type="button" id="btn-today" class="btn btn--header btn--today" title="今日に戻る">今日</button>
+      </div>
       <div class="header-bar__stats">
         <span class="header-bar__label">窓口総額</span>
         <span id="header-total" class="header-bar__total">¥0</span>
@@ -319,6 +323,14 @@
         <button type="button" id="btn-db-import" class="btn btn--outline btn--danger">DBインポート</button>
       </div>
       <input type="file" id="db-import-file" accept=".sqlite,.db" hidden>
+
+      <!-- ストレージ使用量セクション（Phase 15 T15.2） -->
+      <h3 class="section-title section-title--compact api-settings__title">ストレージ</h3>
+      <div id="storage-usage-display" class="storage-usage">
+        <span id="storage-usage-text" class="storage-usage__text">計算中...</span>
+        <span id="storage-persist-status" class="storage-usage__status"></span>
+      </div>
+
       <div class="csv-export__actions">
         <button type="button" id="btn-db-close" class="btn btn--outline">閉じる</button>
       </div>

@@ -773,3 +773,56 @@ describe('syncReservationsFromCsv (Phase 14 merge)', () => {
     expect(itemRows.length).toBe(0);
   });
 });
+
+// ==========================================================================
+// Phase 15: Date-parameterized repository functions (T15.3)
+// ==========================================================================
+
+describe('getTodayVisitorList with targetDate parameter', () => {
+  it('returns transactions for the specified date, not today', () => {
+    insertMember({ id: 'T-0001', name: 'A' });
+    insertTransaction({ date: '2026-03-20', member_id: 'T-0001', member_name_snapshot: 'A' });
+    insertTransaction({ date: '2026-04-16', member_id: 'T-0001', member_name_snapshot: 'A' });
+
+    const marchRows = globalThis.getTodayVisitorList('2026-03-20');
+    expect(marchRows.length).toBe(1);
+    expect(marchRows[0].date).toBe('2026-03-20');
+
+    const aprilRows = globalThis.getTodayVisitorList('2026-04-16');
+    expect(aprilRows.length).toBe(1);
+    expect(aprilRows[0].date).toBe('2026-04-16');
+  });
+});
+
+describe('addMemberTransaction with targetDate parameter', () => {
+  it('inserts a transaction on the specified date', async () => {
+    insertMember({ id: 'T-0001', name: 'A' });
+    await globalThis.addMemberTransaction('T-0001', '2026-03-15');
+    const rows = globalThis.dbQuery('SELECT date FROM transactions WHERE member_id = ?', ['T-0001']);
+    expect(rows.length).toBe(1);
+    expect(rows[0].date).toBe('2026-03-15');
+  });
+});
+
+describe('addItemToMemberToday with targetDate parameter', () => {
+  it('creates a transaction and item on the specified date', async () => {
+    insertMember({ id: 'T-0001', name: 'A' });
+    await globalThis.addItemToMemberToday('T-0001', { code: '001', name: '体験', price: 1100 }, '2026-03-10');
+    const txn = globalThis.dbQuery('SELECT id, date FROM transactions WHERE member_id = ? AND date = ?', ['T-0001', '2026-03-10']);
+    expect(txn.length).toBe(1);
+    expect(txn[0].date).toBe('2026-03-10');
+    const items = globalThis.dbQuery('SELECT product_code FROM transaction_items WHERE transaction_id = ?', [txn[0].id]);
+    expect(items.length).toBe(1);
+    expect(items[0].product_code).toBe('001');
+  });
+});
+
+describe('createWalkInWithTransaction with targetDate parameter', () => {
+  it('creates a walk-in member and transaction on the specified date', async () => {
+    const walkInId = await globalThis.createWalkInWithTransaction('テスト来場者', '2026-03-05');
+    expect(walkInId).toMatch(/^W-20260305-/);
+    const txn = globalThis.dbQuery('SELECT date FROM transactions WHERE member_id = ?', [walkInId]);
+    expect(txn.length).toBe(1);
+    expect(txn[0].date).toBe('2026-03-05');
+  });
+});

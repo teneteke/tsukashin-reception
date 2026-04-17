@@ -764,7 +764,7 @@ async function runSaasSyncPipeline(files) {
       } else if (kind === 'payment') {
         summary.payments = await syncPaymentMethodsFromCsv(headers, rows);
       } else if (kind === 'reservation') {
-        summary.reservations = await syncReservationsFromCsv(headers, rows);
+        summary.reservations = await syncReservationsFromCsv(headers, rows, typeof getWorkingDate === 'function' ? getWorkingDate() : undefined);
       } else {
         summary.unknownFiles.push(file.name);
       }
