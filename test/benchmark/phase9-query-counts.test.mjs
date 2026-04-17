@@ -127,7 +127,7 @@ describe('renderVisitorTable: fixed query count', () => {
   it('issues exactly 3 queries for 20 seeded transactions (visitor list plus two DISTINCTs)', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-04-16T06:00:00Z'));
-    globalThis.currentWorkingDate = '2026-04-16';
+    globalThis.setWorkingDateForTest('2026-04-16');
     setupTableDom();
 
     /** Seed 20 members with mixed class / timeslot values to exercise the DISTINCTs. */
@@ -162,7 +162,7 @@ describe('renderVisitorTable: fixed query count', () => {
   it('still issues exactly 3 queries for 5 visitors (count-independent)', async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date('2026-04-16T06:00:00Z'));
-    globalThis.currentWorkingDate = '2026-04-16';
+    globalThis.setWorkingDateForTest('2026-04-16');
     setupTableDom();
 
     globalThis.db.run('BEGIN TRANSACTION');

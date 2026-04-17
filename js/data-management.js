@@ -150,21 +150,39 @@ async function updateStorageUsageDisplay() {
     return;
   }
 
-  try {
-    const estimate = await navigator.storage.estimate();
+  /** estimate と persisted は独立なので並列発火し、結果を個別に処理する。
+   *  persisted だけ失敗しても使用量表示を潰さないためのエラー分離。 */
+  const hasPersistedApi = typeof navigator.storage.persisted === 'function';
+  const [estimateResult, persistedResult] = await Promise.allSettled([
+    navigator.storage.estimate(),
+    hasPersistedApi ? navigator.storage.persisted() : Promise.resolve(undefined),
+  ]);
+
+  let estimateSucceeded = false;
+  if (estimateResult.status === 'fulfilled') {
+    const estimate = estimateResult.value;
     const usageMB = ((estimate.usage || 0) / 1024 / 1024).toFixed(1);
     const quotaGB = ((estimate.quota || 0) / 1024 / 1024 / 1024).toFixed(1);
     textEl.textContent = `使用: ${usageMB} MB / 上限: ${quotaGB} GB`;
-
-    if (statusEl && typeof navigator.storage.persisted === 'function') {
-      const isPersisted = await navigator.storage.persisted();
-      statusEl.textContent = isPersisted ? '（永続化: 有効）' : '（永続化: 未設定）';
-      statusEl.classList.toggle('storage-usage__status--ok', isPersisted);
-    }
-  } catch (error) {
-    console.warn('ストレージ情報の取得に失敗:', error);
+    estimateSucceeded = true;
+  } else {
+    console.warn('ストレージ使用量の取得に失敗:', estimateResult.reason);
     textEl.textContent = 'ストレージ情報を取得できませんでした';
     if (statusEl) statusEl.textContent = '';
+  }
+
+  if (!estimateSucceeded) return;
+
+  if (!statusEl || !hasPersistedApi) return;
+
+  if (persistedResult.status === 'fulfilled') {
+    const isPersisted = persistedResult.value;
+    statusEl.textContent = isPersisted ? '（永続化: 有効）' : '（永続化: 未設定）';
+    statusEl.classList.toggle('storage-usage__status--ok', isPersisted);
+  } else {
+    console.warn('永続化状態の取得に失敗:', persistedResult.reason);
+    statusEl.textContent = '';
+    statusEl.classList.remove('storage-usage__status--ok');
   }
 }
 

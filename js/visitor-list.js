@@ -41,6 +41,18 @@ function getWorkingDate() {
 }
 
 /**
+ * 作業日を設定する。テスト専用のアフォーダンス。
+ * 本番 UI からは呼ばない。日付入力の change イベントと「今日」ボタンが
+ * 唯一の正規ルートで、これらはピッカー初期化時にリスナー経由で state を更新する。
+ * ベンチマーク／単体テストが module-level `currentWorkingDate` を直接書き換える
+ * 代わりに、このセッター経由で明示的に意図を示すために用意。
+ * @param {string} date - YYYY-MM-DD
+ */
+function setWorkingDateForTest(date) {
+  currentWorkingDate = date;
+}
+
+/**
  * ヘッダーの日付入力と「今日」ボタンを初期化する
  */
 function initWorkingDatePicker() {
@@ -49,6 +61,9 @@ function initWorkingDatePicker() {
   if (!dateInput) return;
 
   dateInput.value = currentWorkingDate;
+
+  /** 作業日が今日と異なる状態で初期化された場合に備えて見た目を同期。 */
+  updateDateInputAppearance(dateInput);
 
   dateInput.addEventListener('change', () => {
     const newDate = dateInput.value;
@@ -399,8 +414,9 @@ async function addMemberToToday(memberId) {
   }
 
   try {
-    /** transaction行を作成 */
-    await addMemberTransaction(memberId, currentWorkingDate);
+    /** 非同期中にユーザが日付を切り替えてもガードと INSERT が同じ日付を指すよう、
+     *  関数先頭でキャプチャした today を使う。 */
+    await addMemberTransaction(memberId, today);
 
     /** テーブルを再描画 */
     renderVisitorTable();

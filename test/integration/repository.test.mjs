@@ -826,3 +826,170 @@ describe('createWalkInWithTransaction with targetDate parameter', () => {
     expect(txn[0].date).toBe('2026-03-05');
   });
 });
+
+// ==========================================================================
+// Phase 17: Fallback path tests for four Phase 15 date-parameterized functions (T17.4)
+// ==========================================================================
+
+describe('Phase 15 repository functions fall back to today JST when targetDate is omitted or falsy', () => {
+  const FIXED_TODAY = '2026-04-17';
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    /** Lock the clock to a JST-friendly UTC time that yields FIXED_TODAY through
+     *  the `sv-SE` + `Asia/Tokyo` helper used by getTodayJST. 06:00 UTC is
+     *  15:00 JST, safely inside the same calendar day in both zones. */
+    vi.setSystemTime(new Date('2026-04-17T06:00:00Z'));
+  });
+
+  it('getTodayVisitorList with undefined targetDate falls back to today JST', () => {
+    insertMember({ id: 'T-0001', name: 'A' });
+    insertTransaction({ date: FIXED_TODAY, member_id: 'T-0001', member_name_snapshot: 'A' });
+    insertTransaction({ date: '2026-03-20', member_id: 'T-0001', member_name_snapshot: 'A' });
+
+    const rows = globalThis.getTodayVisitorList();
+    expect(rows.length).toBe(1);
+    expect(rows[0].date).toBe(FIXED_TODAY);
+  });
+
+  it('getTodayVisitorList with null targetDate falls back to today JST', () => {
+    insertMember({ id: 'T-0001', name: 'A' });
+    insertTransaction({ date: FIXED_TODAY, member_id: 'T-0001', member_name_snapshot: 'A' });
+
+    const rows = globalThis.getTodayVisitorList(null);
+    expect(rows.length).toBe(1);
+    expect(rows[0].date).toBe(FIXED_TODAY);
+  });
+
+  it('addMemberTransaction with undefined targetDate inserts on today JST', async () => {
+    insertMember({ id: 'T-0001', name: 'A' });
+
+    await globalThis.addMemberTransaction('T-0001');
+
+    const rows = globalThis.dbQuery('SELECT date FROM transactions WHERE member_id = ?', ['T-0001']);
+    expect(rows.length).toBe(1);
+    expect(rows[0].date).toBe(FIXED_TODAY);
+  });
+
+  it('addItemToMemberToday with undefined targetDate creates the transaction on today JST', async () => {
+    insertMember({ id: 'T-0001', name: 'A' });
+
+    await globalThis.addItemToMemberToday('T-0001', { code: '001', name: '体験', price: 1100 });
+
+    const txn = globalThis.dbQuery('SELECT date FROM transactions WHERE member_id = ?', ['T-0001']);
+    expect(txn.length).toBe(1);
+    expect(txn[0].date).toBe(FIXED_TODAY);
+  });
+
+  it('createWalkInWithTransaction with undefined targetDate uses today JST for id prefix and transaction date', async () => {
+    const walkInId = await globalThis.createWalkInWithTransaction('テスト来場者');
+
+    /** id prefix is todays date compacted (YYYYMMDD with no dashes). */
+    expect(walkInId).toMatch(/^W-20260417-/);
+    const txn = globalThis.dbQuery('SELECT date FROM transactions WHERE member_id = ?', [walkInId]);
+    expect(txn.length).toBe(1);
+    expect(txn[0].date).toBe(FIXED_TODAY);
+  });
+});
+
+// ==========================================================================
+// Phase 17: Boundary-value tests for four Phase 15 date-parameterized functions (T17.5)
+//
+// These tests lock the *current* unvalidated behavior of the four repository
+// functions. The contrast with `syncReservationsFromCsv` is deliberate: the
+// CSV sync validates because it sits at an external input boundary, while
+// these four are only called from internal code. The tests document the
+// observed policy rather than enforce validation.
+// ==========================================================================
+
+describe('Phase 15 repository functions observed behavior for ill-formed targetDate', () => {
+  const FIXED_TODAY = '2026-04-17';
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-04-17T06:00:00Z'));
+  });
+
+  it('getTodayVisitorList with empty-string targetDate falls back to today JST through the falsy coercion', () => {
+    insertMember({ id: 'T-0001', name: 'A' });
+    insertTransaction({ date: FIXED_TODAY, member_id: 'T-0001', member_name_snapshot: 'A' });
+    insertTransaction({ date: '2026-03-20', member_id: 'T-0001', member_name_snapshot: 'A' });
+
+    const rows = globalThis.getTodayVisitorList('');
+    expect(rows.length).toBe(1);
+    expect(rows[0].date).toBe(FIXED_TODAY);
+  });
+
+  it('getTodayVisitorList with a non-date string returns zero rows because no transaction date matches verbatim', () => {
+    insertMember({ id: 'T-0001', name: 'A' });
+    insertTransaction({ date: FIXED_TODAY, member_id: 'T-0001', member_name_snapshot: 'A' });
+
+    const rows = globalThis.getTodayVisitorList('invalid-date-string');
+    expect(rows.length).toBe(0);
+  });
+
+  it('addMemberTransaction with empty-string targetDate falls back to today JST', async () => {
+    insertMember({ id: 'T-0001', name: 'A' });
+
+    await globalThis.addMemberTransaction('T-0001', '');
+
+    const rows = globalThis.dbQuery('SELECT date FROM transactions WHERE member_id = ?', ['T-0001']);
+    expect(rows.length).toBe(1);
+    expect(rows[0].date).toBe(FIXED_TODAY);
+  });
+
+  it('addMemberTransaction with a non-date string propagates the string verbatim into the date column', async () => {
+    /** No validation exists; the column accepts any TEXT. This locks the
+     *  observed behavior so a future refactor cannot silently change it. */
+    insertMember({ id: 'T-0001', name: 'A' });
+
+    await globalThis.addMemberTransaction('T-0001', 'not-a-date');
+
+    const rows = globalThis.dbQuery('SELECT date FROM transactions WHERE member_id = ?', ['T-0001']);
+    expect(rows.length).toBe(1);
+    expect(rows[0].date).toBe('not-a-date');
+  });
+
+  it('addItemToMemberToday with empty-string targetDate creates the transaction on today JST', async () => {
+    insertMember({ id: 'T-0001', name: 'A' });
+
+    await globalThis.addItemToMemberToday('T-0001', { code: '001', name: '体験', price: 1100 }, '');
+
+    const rows = globalThis.dbQuery('SELECT date FROM transactions WHERE member_id = ?', ['T-0001']);
+    expect(rows.length).toBe(1);
+    expect(rows[0].date).toBe(FIXED_TODAY);
+  });
+
+  it('addItemToMemberToday with a non-zero-padded date propagates the string verbatim', async () => {
+    /** Shape like 2026-4-17 (not zero-padded). No validation exists, so the
+     *  string lands in the date column as-is. Observed-behavior lock. */
+    insertMember({ id: 'T-0001', name: 'A' });
+
+    await globalThis.addItemToMemberToday('T-0001', { code: '001', name: '体験', price: 1100 }, '2026-4-17');
+
+    const rows = globalThis.dbQuery('SELECT date FROM transactions WHERE member_id = ?', ['T-0001']);
+    expect(rows.length).toBe(1);
+    expect(rows[0].date).toBe('2026-4-17');
+  });
+
+  it('createWalkInWithTransaction with empty-string targetDate uses today JST for both id prefix and transaction date', async () => {
+    const walkInId = await globalThis.createWalkInWithTransaction('テスト来場者', '');
+
+    expect(walkInId).toMatch(/^W-20260417-/);
+    const txn = globalThis.dbQuery('SELECT date FROM transactions WHERE member_id = ?', [walkInId]);
+    expect(txn.length).toBe(1);
+    expect(txn[0].date).toBe(FIXED_TODAY);
+  });
+
+  it('createWalkInWithTransaction with a non-date string embeds the compacted form in the walk-in id', async () => {
+    /** The id prefix is `W-${targetDate.replace(/-/g, '')}-`. A non-date
+     *  string with dashes gets the dashes stripped and embedded as-is.
+     *  No validation exists; this records the observed shape. */
+    const walkInId = await globalThis.createWalkInWithTransaction('テスト来場者', 'bad-date-str');
+
+    expect(walkInId).toMatch(/^W-baddatestr-/);
+    const txn = globalThis.dbQuery('SELECT date FROM transactions WHERE member_id = ?', [walkInId]);
+    expect(txn.length).toBe(1);
+    expect(txn[0].date).toBe('bad-date-str');
+  });
+});
