@@ -165,11 +165,7 @@ describe('syncReservationsFromCsv: OPFS write batching', () => {
     saveToOPFSSpy.mockClear();
   });
 
-  it('50-row reservation CSV import produces exactly one saveToOPFS call after confirmation', async () => {
-    /** Stub the in-app confirm to auto-accept. */
-    const originalConfirm = globalThis.window.confirmAction;
-    globalThis.window.confirmAction = async () => true;
-
+  it('50-row reservation CSV import produces exactly one saveToOPFS call (Phase 14 auto-merge)', async () => {
     const headers = ['会員ID', '日付'];
     const rows = [];
     for (let i = 0; i < 50; i++) {
@@ -178,31 +174,27 @@ describe('syncReservationsFromCsv: OPFS write batching', () => {
 
     const result = await globalThis.syncReservationsFromCsv(headers, rows, '2026-04-16');
 
-    expect(result.confirmed).toBe(true);
     expect(result.added).toBe(50);
+    expect(result.autoDeleted.length).toBe(0);
     expect(saveToOPFSSpy).toHaveBeenCalledTimes(1);
-
-    /** Cleanup: restore stub. */
-    globalThis.window.confirmAction = originalConfirm;
   });
 
-  it('cancelled confirmation results in zero saveToOPFS calls', async () => {
-    const originalConfirm = globalThis.window.confirmAction;
-    globalThis.window.confirmAction = async () => false;
+  it('Phase 14 merge auto-deletes unprotected locals in a single commit', async () => {
+    /** Seed five unprotected reservations that are all missing from the incoming CSV. */
+    const seedHeaders = ['会員ID', '日付'];
+    const seedRows = [];
+    for (let i = 0; i < 5; i++) {
+      seedRows.push([`T-${String(i).padStart(4, '0')}`, '2026-04-16']);
+    }
+    await globalThis.syncReservationsFromCsv(seedHeaders, seedRows, '2026-04-16');
+    saveToOPFSSpy.mockClear();
 
-    const headers = ['会員ID', '日付'];
-    const rows = [
-      ['T-0001', '2026-04-16'],
-      ['T-0002', '2026-04-16'],
-    ];
+    /** Run the merge with an empty CSV: every seeded row should be auto-deleted. */
+    const result = await globalThis.syncReservationsFromCsv(seedHeaders, [], '2026-04-16');
 
-    const result = await globalThis.syncReservationsFromCsv(headers, rows, '2026-04-16');
-
-    expect(result.confirmed).toBe(false);
     expect(result.added).toBe(0);
-    expect(saveToOPFSSpy).toHaveBeenCalledTimes(0);
-
-    globalThis.window.confirmAction = originalConfirm;
+    expect(result.autoDeleted.length).toBe(5);
+    expect(saveToOPFSSpy).toHaveBeenCalledTimes(1);
   });
 });
 

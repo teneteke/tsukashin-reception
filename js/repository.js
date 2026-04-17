@@ -247,6 +247,29 @@ function hasTransactionForDate(date, memberId) {
 }
 
 /**
+ * 指定日の全予約（トランザクション）を、members JOIN で is_temporary も含めて取得する。
+ * Phase 14 のマージ判定で、CSVに載っていないローカル行を自動削除するか保護するかを決める判断材料となる。
+ * members が削除済みのトランザクション（孤児）は is_temporary=0 として扱う。
+ * @param {string} date - YYYY-MM-DD
+ * @returns {Array<{id:number, member_id:string, member_name_snapshot:string, is_attended:number, is_received:number, is_temporary:number}>}
+ */
+function getDateReservationsWithProtectionFlags(date) {
+  return dbQuery(`
+    SELECT
+      t.id,
+      t.member_id,
+      t.member_name_snapshot,
+      t.is_attended,
+      t.is_received,
+      COALESCE(m.is_temporary, 0) AS is_temporary
+    FROM transactions t
+    LEFT JOIN members m ON t.member_id = m.id
+    WHERE t.date = ?
+    ORDER BY t.id ASC
+  `, [date]);
+}
+
+/**
  * 会員を本日の来館者として追加する
  * @param {string} memberId
  * @returns {Promise<void>}

@@ -182,3 +182,185 @@
   /** グローバル公開 */
   window.confirmAction = confirmAction;
 })();
+
+/**
+ * Phase 14 T14.4: 予約CSVマージ結果の read-only ダイアログ
+ *
+ * 4セクション構成: 新規追加 count / 維持 count / 自動削除リスト / 保護リスト。
+ * リスト行は「氏名 (ID)」形式、保護リストには保護理由を付与。
+ * 単一 OK ボタンで閉じる。Esc / Enter / 背景クリックでも閉じる。
+ *
+ * 使い方:
+ *   await showSyncResult({
+ *     added: 2, alreadyExists: 5,
+ *     autoDeleted: [{id, member_id, member_name}, ...],
+ *     protectedRows: [{id, member_id, member_name, reason}, ...],
+ *     notInMaster: ['X-9999'],
+ *   });
+ */
+(function () {
+  'use strict';
+
+  /** 保護理由コードから日本語ラベルへの対応表 */
+  const PROTECTION_REASON_LABELS = {
+    received: '受領済み',
+    attended: '出席済み',
+    'walk-in': 'ウォークイン',
+  };
+
+  let resultSession = null;
+
+  /** 内部ユーティリティ: HTMLエスケープ（ui-helpers.js の escapeHtml と同義だが独立実装で依存関係を単純化） */
+  function esc(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  /** 本文の DOM を組み立てる */
+  function renderBody(summary) {
+    const added = summary.added || 0;
+    const alreadyExists = summary.alreadyExists || 0;
+    const autoDeleted = Array.isArray(summary.autoDeleted) ? summary.autoDeleted : [];
+    const protectedRows = Array.isArray(summary.protectedRows) ? summary.protectedRows : [];
+    const notInMaster = Array.isArray(summary.notInMaster) ? summary.notInMaster : [];
+
+    const parts = [];
+
+    parts.push(`<div class="sync-result__counts">`);
+    parts.push(`<div class="sync-result__count-line"><span class="sync-result__count-label">新規追加</span><span class="sync-result__count-value">${added} 件</span></div>`);
+    parts.push(`<div class="sync-result__count-line"><span class="sync-result__count-label">維持（既存）</span><span class="sync-result__count-value">${alreadyExists} 件</span></div>`);
+    parts.push(`</div>`);
+
+    if (autoDeleted.length > 0) {
+      parts.push(`<div class="sync-result__section">`);
+      parts.push(`<h3 class="sync-result__section-title">自動削除（${autoDeleted.length} 件）</h3>`);
+      parts.push(`<ul class="sync-result__list">`);
+      for (const row of autoDeleted) {
+        parts.push(
+          `<li class="sync-result__item">` +
+          `<span class="sync-result__item-name">${esc(row.member_name || '')}</span>` +
+          `<span class="sync-result__item-id">${esc(row.member_id || '')}</span>` +
+          `</li>`
+        );
+      }
+      parts.push(`</ul>`);
+      parts.push(`</div>`);
+    }
+
+    if (protectedRows.length > 0) {
+      parts.push(`<div class="sync-result__section">`);
+      parts.push(`<h3 class="sync-result__section-title">保護（${protectedRows.length} 件）</h3>`);
+      parts.push(`<p class="sync-result__section-note">CSVから外れていましたが、以下の理由で削除しませんでした。</p>`);
+      parts.push(`<ul class="sync-result__list">`);
+      for (const row of protectedRows) {
+        const reason = PROTECTION_REASON_LABELS[row.reason] || row.reason || '';
+        parts.push(
+          `<li class="sync-result__item">` +
+          `<span class="sync-result__item-name">${esc(row.member_name || '')}</span>` +
+          `<span class="sync-result__item-id">${esc(row.member_id || '')}</span>` +
+          `<span class="sync-result__item-reason">${esc(reason)}</span>` +
+          `</li>`
+        );
+      }
+      parts.push(`</ul>`);
+      parts.push(`</div>`);
+    }
+
+    if (notInMaster.length > 0) {
+      parts.push(`<div class="sync-result__section">`);
+      parts.push(`<h3 class="sync-result__section-title">未登録会員（${notInMaster.length} 件）</h3>`);
+      parts.push(`<p class="sync-result__section-note">CSVに載っていましたが、会員マスタに存在しないIDです。</p>`);
+      parts.push(`<ul class="sync-result__list">`);
+      for (const id of notInMaster) {
+        parts.push(
+          `<li class="sync-result__item">` +
+          `<span class="sync-result__item-id">${esc(id)}</span>` +
+          `</li>`
+        );
+      }
+      parts.push(`</ul>`);
+      parts.push(`</div>`);
+    }
+
+    return parts.join('');
+  }
+
+  function cleanupSession(session) {
+    session.btnClose.removeEventListener('click', session.handlers.onClose);
+    session.overlay.removeEventListener('click', session.handlers.onOverlay);
+    document.removeEventListener('keydown', session.handlers.onKeyDown);
+    session.overlay.hidden = true;
+    if (session.previouslyFocused && typeof session.previouslyFocused.focus === 'function') {
+      try {
+        session.previouslyFocused.focus();
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+
+  function finishSession(session) {
+    if (resultSession !== session) return;
+    resultSession = null;
+    cleanupSession(session);
+    session.resolve(undefined);
+  }
+
+  function showSyncResult(summary) {
+    const overlay = document.getElementById('sync-result-overlay');
+    const body = document.getElementById('sync-result-body');
+    const btnClose = document.getElementById('btn-sync-result-close');
+
+    if (!overlay || !body || !btnClose) {
+      console.error('サマリダイアログのDOMが見つかりません。index.htmlの#sync-result-overlayブロックを確認してください。');
+      return Promise.resolve();
+    }
+
+    if (resultSession) {
+      const prev = resultSession;
+      resultSession = null;
+      cleanupSession(prev);
+      prev.resolve(undefined);
+    }
+
+    body.innerHTML = renderBody(summary || {});
+    overlay.hidden = false;
+
+    const previouslyFocused = document.activeElement;
+
+    return new Promise((resolve) => {
+      const session = {
+        resolve,
+        previouslyFocused,
+        overlay,
+        btnClose,
+        handlers: {},
+      };
+
+      session.handlers.onClose = () => finishSession(session);
+      session.handlers.onOverlay = (event) => {
+        if (event.target === overlay) finishSession(session);
+      };
+      session.handlers.onKeyDown = (event) => {
+        if (event.key === 'Escape' || event.key === 'Enter') {
+          event.preventDefault();
+          finishSession(session);
+        }
+      };
+
+      btnClose.addEventListener('click', session.handlers.onClose);
+      overlay.addEventListener('click', session.handlers.onOverlay);
+      document.addEventListener('keydown', session.handlers.onKeyDown);
+
+      resultSession = session;
+      setTimeout(() => btnClose.focus(), 0);
+    });
+  }
+
+  window.showSyncResult = showSyncResult;
+})();

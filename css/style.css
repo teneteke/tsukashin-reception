@@ -1562,3 +1562,101 @@ button {
   justify-content: flex-end;
   gap: var(--sp-2);
 }
+
+/* ==========================================================================
+ * Section 20: Phase 14 — 予約CSV取り込み結果ダイアログ
+ * ========================================================================== */
+
+.sync-result__body {
+  max-height: 60vh;
+  overflow-y: auto;
+  margin-bottom: var(--sp-4);
+}
+
+.sync-result__counts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+  padding-bottom: var(--sp-3);
+  border-bottom: 1px solid var(--border);
+  margin-bottom: var(--sp-3);
+}
+
+.sync-result__count-line {
+  display: flex;
+  justify-content: space-between;
+  font: var(--text-body);
+  color: var(--foreground);
+}
+
+.sync-result__count-label {
+  color: var(--foreground-secondary);
+}
+
+.sync-result__count-value {
+  font-variant-numeric: tabular-nums;
+}
+
+.sync-result__section {
+  padding-bottom: var(--sp-3);
+  margin-bottom: var(--sp-3);
+  border-bottom: 1px solid var(--border);
+}
+
+.sync-result__section:last-child {
+  border-bottom: none;
+  margin-bottom: 0;
+  padding-bottom: 0;
+}
+
+.sync-result__section-title {
+  font: var(--text-h2);
+  color: var(--foreground);
+  margin: 0 0 var(--sp-2) 0;
+}
+
+.sync-result__section-note {
+  font: var(--text-small);
+  color: var(--foreground-secondary);
+  margin: 0 0 var(--sp-2) 0;
+}
+
+.sync-result__list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--sp-1);
+}
+
+.sync-result__item {
+  display: flex;
+  align-items: baseline;
+  gap: var(--sp-2);
+  padding: var(--sp-1) 0;
+}
+
+.sync-result__item-name {
+  font: var(--text-body);
+  color: var(--foreground);
+  flex: 0 0 auto;
+}
+
+.sync-result__item-id {
+  font: var(--text-caption);
+  color: var(--foreground-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.sync-result__item-reason {
+  font: var(--text-small);
+  color: var(--warning);
+  margin-left: auto;
+}
+
+.sync-result__actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--sp-2);
+}

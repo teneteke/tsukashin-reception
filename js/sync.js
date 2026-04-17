@@ -465,6 +465,114 @@ function classifyReservationRows(rows, columnMap, defaultDate) {
   return { toAdd, unknownIds, alreadyExists };
 }
 
+/**
+ * Phase 14: 予約CSVマージ用分類器。
+ * 流入CSVと、T14.1 の getDateReservationsWithProtectionFlags が返した既存行を受け取り、
+ * 5バケット（toInsert / alreadyExists / toAutoDelete / toProtect / notInMaster）に振り分ける純関数。
+ * DBアクセスは一切行わない。呼び出し側が memberMap と existingProtectionRows を用意する。
+ *
+ * 保護ルール: is_received=1 / is_attended=1 / is_temporary=1 のいずれかで保護対象。
+ * 優先順位は received > attended > walk-in（金銭が絡む順）。
+ *
+ * 単日スコープ: targetDate と異なる日付を持つCSV行は無視する。
+ * @param {Array<Array<string>>} csvRows - CSV行配列
+ * @param {Object} columnMap - buildColumnMap 出力（member_id, date）
+ * @param {string} targetDate - YYYY-MM-DD
+ * @param {Array<Object>} existingProtectionRows - T14.1 の戻り値
+ * @param {Map<string, {id, name}>} memberMap - 会員IDから会員情報への参照
+ * @returns {{toInsert:Array, alreadyExists:Array, toAutoDelete:Array, toProtect:Array, notInMaster:Array<string>}}
+ */
+function classifyReservationsForMerge(csvRows, columnMap, targetDate, existingProtectionRows, memberMap) {
+  const toInsert = [];
+  const alreadyExists = [];
+  const toAutoDelete = [];
+  const toProtect = [];
+  const notInMasterSet = new Set();
+
+  /** Step 1: targetDate に該当するCSV行から member_id 集合を作る */
+  const csvMemberIds = new Set();
+  for (const row of csvRows) {
+    const memberId = getFieldValue(row, columnMap.member_id);
+    if (!memberId) continue;
+    const rawDate = getFieldValue(row, columnMap.date);
+    if (rawDate && !DATE_PATTERN.test(rawDate)) continue;
+    const rowDate = rawDate || targetDate;
+    if (rowDate !== targetDate) continue;
+    csvMemberIds.add(memberId);
+  }
+
+  /** Step 2: 既存行を走査。CSVに無いものを保護/自動削除に振り分け */
+  const existingMemberIds = new Set();
+  for (const txn of existingProtectionRows) {
+    existingMemberIds.add(txn.member_id);
+    if (csvMemberIds.has(txn.member_id)) continue;
+
+    let reason = null;
+    if (txn.is_received) reason = 'received';
+    else if (txn.is_attended) reason = 'attended';
+    else if (txn.is_temporary) reason = 'walk-in';
+
+    if (reason) {
+      toProtect.push({
+        id: txn.id,
+        member_id: txn.member_id,
+        member_name: txn.member_name_snapshot,
+        reason,
+      });
+    } else {
+      toAutoDelete.push({
+        id: txn.id,
+        member_id: txn.member_id,
+        member_name: txn.member_name_snapshot,
+      });
+    }
+  }
+
+  /** Step 3: CSV行を走査。未登録会員・既存・新規に振り分け
+   *  T14.7: member_id 単位でデデュープし、CSV重複行によるカウント膨張を防止する */
+  const seenCsvMemberIds = new Set();
+  for (const row of csvRows) {
+    const memberId = getFieldValue(row, columnMap.member_id);
+    if (!memberId) continue;
+    const rawDate = getFieldValue(row, columnMap.date);
+    if (rawDate && !DATE_PATTERN.test(rawDate)) continue;
+    const rowDate = rawDate || targetDate;
+    if (rowDate !== targetDate) continue;
+    if (seenCsvMemberIds.has(memberId)) continue;
+    seenCsvMemberIds.add(memberId);
+
+    const member = memberMap.get(memberId);
+    if (!member) {
+      notInMasterSet.add(memberId);
+      continue;
+    }
+
+    if (existingMemberIds.has(memberId)) {
+      alreadyExists.push({ member_id: memberId, member_name: member.name });
+    } else {
+      toInsert.push({ date: targetDate, member_id: memberId, member_name: member.name });
+    }
+  }
+
+  return {
+    toInsert,
+    alreadyExists,
+    toAutoDelete,
+    toProtect,
+    notInMaster: Array.from(notInMasterSet),
+  };
+}
+
+/**
+ * Phase 14: 予約CSVを Git 的マージで取り込む。
+ * 事前 confirm は廃止。T14.1 で既存行を fetch → T14.2 で5バケット分類 → 単一トランザクションで INSERT + DELETE。
+ * 保護ルール: is_received / is_attended / is_temporary のいずれか立っていれば削除しない。
+ *
+ * @param {string[]} headers - CSVヘッダ
+ * @param {Array<Array<string>>} rows - CSVデータ行
+ * @param {string} [targetDate] - マージ対象日 YYYY-MM-DD（省略時は本日JST）
+ * @returns {Promise<{added:number, alreadyExists:number, notInMaster:string[], autoDeleted:Array, protectedRows:Array}>}
+ */
 async function syncReservationsFromCsv(headers, rows, targetDate) {
   const columnMap = buildColumnMap(headers, RESERVATION_COLUMN_ALIASES);
 
@@ -472,42 +580,50 @@ async function syncReservationsFromCsv(headers, rows, targetDate) {
     throw new Error('予約CSVに必須列（会員ID または member_id）が見つかりませんでした');
   }
 
-  const defaultDate = targetDate || getTodayJST();
-
   if (targetDate && !DATE_PATTERN.test(targetDate)) {
     throw new Error('targetDate の形式が不正です（YYYY-MM-DD）: ' + targetDate);
   }
 
-  /** 事前集計（DB書き込みなし） */
-  const { toAdd, unknownIds, alreadyExists } = classifyReservationRows(rows, columnMap, defaultDate);
-  const addedPlanned = toAdd.length;
-  const notInMaster = unknownIds.length;
+  const effectiveDate = targetDate || getTodayJST();
 
-  /** ユーザー確認 */
-  const message =
-    `予約CSVを取り込みます。\n\n` +
-    `追加予定: ${addedPlanned} 件\n` +
-    `既に存在: ${alreadyExists} 件\n` +
-    `未登録会員: ${notInMaster} 件\n\n` +
-    `実行しますか？`;
+  /** T14.1: 対象日の既存行を保護フラグ付きで取得 */
+  const existingProtectionRows = getDateReservationsWithProtectionFlags(effectiveDate);
 
-  const ok = typeof window.confirmAction === 'function'
-    ? await window.confirmAction('予約データの取り込み', message)
-    : window.confirm(message);
-
-  if (!ok) {
-    console.log('予約同期: ユーザーがキャンセルしました');
-    return { confirmed: false, added: 0, alreadyExists, notInMaster, unknownIds };
+  /** CSVに現れる member_id を一括で会員Map化（未登録判定のため） */
+  const csvMemberIds = new Set();
+  for (const row of rows) {
+    const mid = getFieldValue(row, columnMap.member_id);
+    if (mid) csvMemberIds.add(mid);
+  }
+  const memberMap = new Map();
+  if (csvMemberIds.size > 0) {
+    const ids = Array.from(csvMemberIds);
+    const placeholders = ids.map(() => '?').join(',');
+    const memberRows = dbQuery(
+      `SELECT id, name FROM members WHERE id IN (${placeholders})`,
+      ids
+    );
+    for (const m of memberRows) {
+      memberMap.set(m.id, m);
+    }
   }
 
-  /** 確認OK: INSERT ループを単一トランザクションで実行（Phase 9 T9.3）
-   *  OPFS 書き込みは commit 後の1回のみ。個別 INSERT 失敗は per-row catch で握りつぶし、
-   *  残りの行は引き続き処理する（SQLite の statement-level error はトランザクションを中断しない）。 */
+  /** T14.2: 5バケットに分類 */
+  const {
+    toInsert,
+    alreadyExists,
+    toAutoDelete,
+    toProtect,
+    notInMaster,
+  } = classifyReservationsForMerge(rows, columnMap, effectiveDate, existingProtectionRows, memberMap);
+
+  /** 単一トランザクションで INSERT + DELETE。OPFS 書き込みは commit 後の1回のみ。 */
   const now = getNowISO();
   let added = 0;
+  const autoDeletedActual = [];
 
   await withTransaction(async () => {
-    for (const item of toAdd) {
+    for (const item of toInsert) {
       try {
         await dbRun(
           `INSERT INTO transactions
@@ -520,11 +636,29 @@ async function syncReservationsFromCsv(headers, rows, targetDate) {
         console.error('予約INSERT失敗:', error.message, 'member_id=' + item.member_id);
       }
     }
+
+    for (const row of toAutoDelete) {
+      try {
+        await dbRun('DELETE FROM transactions WHERE id = ?', [row.id]);
+        autoDeletedActual.push(row);
+      } catch (error) {
+        console.error('予約DELETE失敗:', error.message, 'id=' + row.id);
+      }
+    }
   });
 
-  console.log(`予約同期完了: 追加 ${added} 件, 既存 ${alreadyExists} 件, 未登録 ${notInMaster} 件`);
+  console.log(
+    `予約マージ完了: 追加 ${added} 件, 維持 ${alreadyExists.length} 件, ` +
+    `自動削除 ${autoDeletedActual.length} 件, 保護 ${toProtect.length} 件, 未登録 ${notInMaster.length} 件`
+  );
 
-  return { confirmed: true, added, alreadyExists, notInMaster, unknownIds };
+  return {
+    added,
+    alreadyExists: alreadyExists.length,
+    notInMaster,
+    autoDeleted: autoDeletedActual,
+    protectedRows: toProtect,
+  };
 }
 
 // ============================================
@@ -640,11 +774,28 @@ async function runSaasSyncPipeline(files) {
     }
   }
 
-  /** サマリダイアログ（共有モーダルを情報表示に利用） */
-  if (typeof window.confirmAction === 'function') {
-    await window.confirmAction('取り込み結果', buildSyncSummaryMessage(summary));
-  } else {
-    alert(buildSyncSummaryMessage(summary));
+  /** T14.5: 会員マスタ / 決済方法 / 未知 / エラーファイルは従来通りのテキストサマリダイアログ。
+   *  予約は専用の構造化ダイアログ（T14.4 showSyncResult）に任せる。
+   *  両方ある場合はテキスト → 予約ダイアログ の順で直列表示する。 */
+  const textHasContent =
+    !!summary.members ||
+    !!summary.payments ||
+    summary.unknownFiles.length > 0 ||
+    summary.errorFiles.length > 0;
+
+  if (textHasContent) {
+    if (typeof window.confirmAction === 'function') {
+      await window.confirmAction('取り込み結果', buildSyncSummaryMessage(summary));
+    } else {
+      alert(buildSyncSummaryMessage(summary));
+    }
+  }
+
+  if (summary.reservations && typeof window.showSyncResult === 'function') {
+    await window.showSyncResult(summary.reservations);
+  } else if (summary.reservations) {
+    /** フォールバック: showSyncResult が未ロードの場合はテキストで */
+    alert(buildReservationSummaryText(summary.reservations));
   }
 
   /** 来館者一覧を再描画（新規予約行・クラス/時間枠の変更を反映） */
@@ -654,11 +805,26 @@ async function runSaasSyncPipeline(files) {
 }
 
 /**
+ * 予約サマリをテキスト表現するフォールバック（showSyncResult が利用不可な場合のみ使用）
+ * @param {{added:number, alreadyExists:number, autoDeleted:Array, protectedRows:Array, notInMaster:string[]}} r
+ * @returns {string}
+ */
+function buildReservationSummaryText(r) {
+  const lines = ['予約CSV取り込み結果', ''];
+  lines.push(`新規追加: ${r.added || 0} 件`);
+  lines.push(`維持（既存）: ${r.alreadyExists || 0} 件`);
+  lines.push(`自動削除: ${(r.autoDeleted || []).length} 件`);
+  lines.push(`保護: ${(r.protectedRows || []).length} 件`);
+  lines.push(`未登録会員: ${(r.notInMaster || []).length} 件`);
+  return lines.join('\n');
+}
+
+/**
  * 同期結果サマリを人間可読な文字列に整形する
  * @param {{
  *   members: { updated: number, skipped: number }|null,
  *   payments: { updated: number, deactivated: number, protected: number }|null,
- *   reservations: { confirmed: boolean, added: number, alreadyExists: number, notInMaster: number, unknownIds: string[] }|null,
+ *   reservations: { added: number, alreadyExists: number, notInMaster: string[], autoDeleted: Array, protectedRows: Array }|null,
  *   unknownFiles: string[],
  *   errorFiles: { name: string, message: string }[]
  * }} summary
@@ -682,24 +848,7 @@ function buildSyncSummaryMessage(summary) {
     lines.push('');
   }
 
-  if (summary.reservations) {
-    lines.push('【本日の予約】');
-    if (!summary.reservations.confirmed) {
-      lines.push('  ユーザーによりキャンセルされました');
-    } else {
-      lines.push(`  追加: ${summary.reservations.added} 件`);
-      lines.push(`  既に存在: ${summary.reservations.alreadyExists} 件`);
-      lines.push(`  未登録会員: ${summary.reservations.notInMaster} 件`);
-      if (summary.reservations.unknownIds.length > 0) {
-        const head = summary.reservations.unknownIds.slice(0, 10).join(', ');
-        const more = summary.reservations.unknownIds.length > 10
-          ? ` ... 他 ${summary.reservations.unknownIds.length - 10} 件`
-          : '';
-        lines.push(`  未登録ID: ${head}${more}`);
-      }
-    }
-    lines.push('');
-  }
+  /** T14.5: 予約サマリはテキストには出さず、専用ダイアログ（showSyncResult）に任せる */
 
   if (summary.unknownFiles.length > 0) {
     lines.push('【種別を判定できなかったファイル】');
@@ -713,10 +862,12 @@ function buildSyncSummaryMessage(summary) {
     lines.push('');
   }
 
+  /** T14.5 以降、予約サマリはテキストから外した。
+   *  buildSyncSummaryMessage は呼び出し側の textHasContent が真のときだけ実行されるため、
+   *  この関数内で「何もなかった」パスは発生しない想定だが、保険として残す。 */
   if (
     !summary.members &&
     !summary.payments &&
-    !summary.reservations &&
     summary.unknownFiles.length === 0 &&
     summary.errorFiles.length === 0
   ) {

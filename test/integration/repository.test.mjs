@@ -595,3 +595,181 @@ describe('getSettlementExportData', () => {
     expect(rows[0].product_code).toBeNull();
   });
 });
+
+// ==========================================================================
+// Phase 14: getDateReservationsWithProtectionFlags
+// ==========================================================================
+
+describe('getDateReservationsWithProtectionFlags', () => {
+  it('returns plain unprotected rows for ordinary reservations', () => {
+    insertMember({ id: 'T-0001', name: '山田' });
+    insertTransaction({ date: '2026-04-16', member_id: 'T-0001', member_name_snapshot: '山田' });
+
+    const rows = globalThis.getDateReservationsWithProtectionFlags('2026-04-16');
+    expect(rows.length).toBe(1);
+    expect(rows[0].member_id).toBe('T-0001');
+    expect(rows[0].is_attended).toBe(0);
+    expect(rows[0].is_received).toBe(0);
+    expect(rows[0].is_temporary).toBe(0);
+  });
+
+  it('surfaces is_attended=1 for attended rows', () => {
+    insertMember({ id: 'T-0001', name: '山田' });
+    insertTransaction({ date: '2026-04-16', member_id: 'T-0001', member_name_snapshot: '山田', is_attended: 1 });
+
+    const rows = globalThis.getDateReservationsWithProtectionFlags('2026-04-16');
+    expect(rows[0].is_attended).toBe(1);
+    expect(rows[0].is_received).toBe(0);
+    expect(rows[0].is_temporary).toBe(0);
+  });
+
+  it('surfaces is_received=1 for received rows', () => {
+    insertMember({ id: 'T-0001', name: '山田' });
+    insertTransaction({ date: '2026-04-16', member_id: 'T-0001', member_name_snapshot: '山田', is_received: 1 });
+
+    const rows = globalThis.getDateReservationsWithProtectionFlags('2026-04-16');
+    expect(rows[0].is_attended).toBe(0);
+    expect(rows[0].is_received).toBe(1);
+    expect(rows[0].is_temporary).toBe(0);
+  });
+
+  it('surfaces is_temporary=1 for walk-in members', () => {
+    insertMember({ id: 'W-0001', name: 'ウォークイン', is_temporary: 1 });
+    insertTransaction({ date: '2026-04-16', member_id: 'W-0001', member_name_snapshot: 'ウォークイン' });
+
+    const rows = globalThis.getDateReservationsWithProtectionFlags('2026-04-16');
+    expect(rows[0].member_id).toBe('W-0001');
+    expect(rows[0].is_temporary).toBe(1);
+  });
+
+  it('treats orphan transactions (member deleted) as is_temporary=0 via COALESCE', () => {
+    insertTransaction({ date: '2026-04-16', member_id: 'X-9999', member_name_snapshot: 'ghost' });
+
+    const rows = globalThis.getDateReservationsWithProtectionFlags('2026-04-16');
+    expect(rows.length).toBe(1);
+    expect(rows[0].member_id).toBe('X-9999');
+    expect(rows[0].is_temporary).toBe(0);
+  });
+
+  it('filters strictly by the supplied date', () => {
+    insertMember({ id: 'T-0001', name: '山田' });
+    insertTransaction({ date: '2026-04-15', member_id: 'T-0001', member_name_snapshot: '山田' });
+    insertTransaction({ date: '2026-04-16', member_id: 'T-0001', member_name_snapshot: '山田' });
+    insertTransaction({ date: '2026-04-17', member_id: 'T-0001', member_name_snapshot: '山田' });
+
+    const rows = globalThis.getDateReservationsWithProtectionFlags('2026-04-16');
+    expect(rows.length).toBe(1);
+  });
+
+  it('returns an empty array when no reservations exist for the date', () => {
+    const rows = globalThis.getDateReservationsWithProtectionFlags('2026-04-16');
+    expect(rows).toEqual([]);
+  });
+
+  it('orders results by transaction id ascending', () => {
+    insertMember({ id: 'T-0001', name: '山田' });
+    insertMember({ id: 'T-0002', name: '佐藤' });
+    insertMember({ id: 'T-0003', name: '鈴木' });
+    const id1 = insertTransaction({ date: '2026-04-16', member_id: 'T-0001', member_name_snapshot: '山田' });
+    const id2 = insertTransaction({ date: '2026-04-16', member_id: 'T-0002', member_name_snapshot: '佐藤' });
+    const id3 = insertTransaction({ date: '2026-04-16', member_id: 'T-0003', member_name_snapshot: '鈴木' });
+
+    const rows = globalThis.getDateReservationsWithProtectionFlags('2026-04-16');
+    expect(rows.map((r) => r.id)).toEqual([id1, id2, id3]);
+  });
+});
+
+// ==========================================================================
+// Phase 14: syncReservationsFromCsv (merge executor)
+// ==========================================================================
+
+describe('syncReservationsFromCsv (Phase 14 merge)', () => {
+  it('merges a mixed scenario: inserts new, keeps existing, auto-deletes unprotected, preserves protected', async () => {
+    /** Seed member master with five members. */
+    insertMember({ id: 'T-0001', name: '山田' });
+    insertMember({ id: 'T-0002', name: '佐藤' });
+    insertMember({ id: 'T-0003', name: '鈴木' });
+    insertMember({ id: 'T-0004', name: '田中' });
+    insertMember({ id: 'W-0001', name: 'ウォークイン', is_temporary: 1 });
+
+    /** Seed existing transactions on the target date with mixed protection states. */
+    const id0001 = insertTransaction({ date: '2026-04-16', member_id: 'T-0001', member_name_snapshot: '山田' });                // unprotected, kept in CSV → alreadyExists
+    const id0002 = insertTransaction({ date: '2026-04-16', member_id: 'T-0002', member_name_snapshot: '佐藤' });                // unprotected, missing from CSV → auto-delete
+    const id0003 = insertTransaction({ date: '2026-04-16', member_id: 'T-0003', member_name_snapshot: '鈴木', is_attended: 1 }); // protected by attended
+    const idWalk = insertTransaction({ date: '2026-04-16', member_id: 'W-0001', member_name_snapshot: 'ウォークイン' });        // protected by walk-in
+
+    /** Incoming CSV: keeps T-0001, adds T-0004, omits T-0002 / T-0003 / W-0001, includes unknown X-9999. */
+    const headers = ['会員ID', '日付'];
+    const rows = [
+      ['T-0001', '2026-04-16'],
+      ['T-0004', '2026-04-16'],
+      ['X-9999', '2026-04-16'],
+    ];
+
+    const result = await globalThis.syncReservationsFromCsv(headers, rows, '2026-04-16');
+
+    expect(result.added).toBe(1);
+    expect(result.alreadyExists).toBe(1);
+    expect(result.autoDeleted.length).toBe(1);
+    expect(result.autoDeleted[0].id).toBe(id0002);
+    expect(result.autoDeleted[0].member_id).toBe('T-0002');
+    expect(result.protectedRows.length).toBe(2);
+    const protectedIds = result.protectedRows.map((r) => r.id).sort();
+    expect(protectedIds).toEqual([id0003, idWalk].sort());
+    expect(result.notInMaster).toEqual(['X-9999']);
+
+    /** Verify actual DB state. */
+    const survivors = globalThis.getDateReservationsWithProtectionFlags('2026-04-16');
+    const survivorIds = survivors.map((r) => r.member_id).sort();
+    expect(survivorIds).toEqual(['T-0001', 'T-0003', 'T-0004', 'W-0001']);
+  });
+
+  it('throws when the reservation CSV is missing the required member_id column', async () => {
+    const headers = ['日付'];
+    const rows = [['2026-04-16']];
+    await expect(globalThis.syncReservationsFromCsv(headers, rows, '2026-04-16')).rejects.toThrow(/会員ID/);
+  });
+
+  it('throws when targetDate is malformed', async () => {
+    const headers = ['会員ID', '日付'];
+    await expect(globalThis.syncReservationsFromCsv(headers, [], '2026-4-16')).rejects.toThrow(/YYYY-MM-DD/);
+  });
+
+  it('is idempotent: re-running with the same CSV adds nothing and deletes nothing', async () => {
+    insertMember({ id: 'T-0001', name: 'A' });
+    insertMember({ id: 'T-0002', name: 'B' });
+    const headers = ['会員ID', '日付'];
+    const rows = [
+      ['T-0001', '2026-04-16'],
+      ['T-0002', '2026-04-16'],
+    ];
+
+    const first = await globalThis.syncReservationsFromCsv(headers, rows, '2026-04-16');
+    expect(first.added).toBe(2);
+    expect(first.autoDeleted.length).toBe(0);
+
+    const second = await globalThis.syncReservationsFromCsv(headers, rows, '2026-04-16');
+    expect(second.added).toBe(0);
+    expect(second.alreadyExists).toBe(2);
+    expect(second.autoDeleted.length).toBe(0);
+    expect(second.protectedRows.length).toBe(0);
+  });
+
+  it('cascades transaction_items deletion when a transaction is auto-deleted', async () => {
+    insertMember({ id: 'T-0001', name: 'A' });
+    const txnId = insertTransaction({ date: '2026-04-16', member_id: 'T-0001', member_name_snapshot: 'A' });
+    globalThis.db.run(
+      'INSERT INTO transaction_items (transaction_id, product_code, product_name_snapshot, price_snapshot, quantity) VALUES (?, ?, ?, ?, ?)',
+      [txnId, '001', '体験', 1100, 1]
+    );
+
+    /** Confirm cascade happens even though the transaction has items,
+     *  because the user's Phase 14 rule only protects by attended / received / walk-in. */
+    const headers = ['会員ID', '日付'];
+    const result = await globalThis.syncReservationsFromCsv(headers, [], '2026-04-16');
+
+    expect(result.autoDeleted.length).toBe(1);
+    const itemRows = globalThis.dbQuery('SELECT 1 FROM transaction_items WHERE transaction_id = ?', [txnId]);
+    expect(itemRows.length).toBe(0);
+  });
+});
