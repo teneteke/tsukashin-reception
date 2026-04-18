@@ -16,7 +16,16 @@ const OPFS_DB_FILENAME = 'tsukashin.sqlite';
 const BROADCAST_CHANNEL_NAME = 'tsukashin-app';
 
 /** 現在のスキーマバージョン */
-const CURRENT_SCHEMA_VERSION = 1;
+const CURRENT_SCHEMA_VERSION = 2;
+
+/** 非会員（SaaS売上明細CSVの「非会員」行）を集約する固定擬似会員のID。
+ *  W- プレフィックス（walk-in）と重ならない別プレフィックスを使う。
+ *  会員マスタCSVがこのIDを持つ行を含んだ場合に備え、members 同期側の
+ *  DELETE は is_temporary=0 限定のままで干渉しない設計。 */
+const GUEST_MEMBER_ID = 'GUEST';
+
+/** 非会員擬似会員の表示名。SaaS CSV の列値と一致させておく。 */
+const GUEST_MEMBER_NAME = '非会員';
 
 // ============================================
 // モジュール状態
@@ -534,10 +543,12 @@ function createSchemaV1() {
 function seedData() {
   const now = getNowISO();
 
-  /** settingsシード */
+  /** settingsシード。schema_version は常に 1（初期スキーマの世代）として記録し、
+   *  V2 以降の追加カラム／追加シードは runMigrations で段階的に適用する。
+   *  これによって新規インストールも既存インストールも同じ migration を通って V2 に到達する。 */
   const settingsData = [
     ['csv_encoding', 'utf-8'],
-    ['schema_version', String(CURRENT_SCHEMA_VERSION)],
+    ['schema_version', '1'],
     ['receipt_next_number', '1'],
     ['receipt_issuer', 'テニスラウンジつかしん'],
     ['receipt_issuer_address', ''],
@@ -598,12 +609,28 @@ function seedData() {
  */
 const migrations = {
   /**
-   * 将来のマイグレーション例:
-   * 2: function migrateV1toV2() {
-   *   db.run('ALTER TABLE members ADD COLUMN day_of_week TEXT');
-   *   console.log('マイグレーション: V1 → V2 完了');
-   * }
+   * V2: Phase 18 Sales-detail CSV import の基盤。
+   *   1. transactions.staff_name を追加（担当者のスナップショット）。既に存在する場合は無視する。
+   *   2. 非会員を代表する固定擬似会員行（GUEST_MEMBER_ID / GUEST_MEMBER_NAME, is_temporary=1）を INSERT OR IGNORE で投入。
+   * ALTER TABLE は冪等ではないため、PRAGMA table_info を使った存在チェックで二重適用を回避する。
    */
+  2: function migrateV1toV2() {
+    const columns = dbQuery("PRAGMA table_info('transactions')");
+    const hasStaffName = columns.some((col) => col.name === 'staff_name');
+    if (!hasStaffName) {
+      db.run('ALTER TABLE transactions ADD COLUMN staff_name TEXT');
+    }
+
+    const now = getNowISO();
+    db.run(
+      `INSERT OR IGNORE INTO members
+       (id, name, name_kana, phone, class, timeslot, is_temporary, memo, created_at, updated_at)
+       VALUES (?, ?, NULL, NULL, NULL, NULL, 1, NULL, ?, ?)`,
+      [GUEST_MEMBER_ID, GUEST_MEMBER_NAME, now, now]
+    );
+
+    console.log('マイグレーション: V1 → V2 完了（staff_name 追加 + GUEST擬似会員シード）');
+  }
 };
 
 /**
@@ -675,8 +702,13 @@ async function initDB() {
       /** スキーマ作成 */
       createSchemaV1();
 
-      /** シードデータ投入 */
+      /** シードデータ投入（schema_version は 1 として記録される） */
       seedData();
+
+      /** 新規インストールも段階的 migration を通して CURRENT_SCHEMA_VERSION に追いつかせる。
+       *  既存インストール（OPFS読み込みパス）と同じ migration 関数を通るため、
+       *  V2 以降の schema 追加は migrations map に書けば両パスに自動で反映される。 */
+      runMigrations();
 
       /** OPFSに保存 */
       await saveToOPFS();

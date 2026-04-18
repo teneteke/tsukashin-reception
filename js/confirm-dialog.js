@@ -364,3 +364,195 @@
 
   window.showSyncResult = showSyncResult;
 })();
+
+/**
+ * Phase 18 T18.7: 売上明細CSV取り込み結果の read-only ダイアログ
+ *
+ * セクション構成:
+ *   - 中止時（aborted=true）: 警告バナー + あいまい氏名リスト
+ *   - 成功時（aborted=false）: 6行のカウンタセクション（追加取引 / 更新取引 /
+ *     明細追加 / 重複スキップ / 未解決決済 / パースエラー）と、自動作成会員リスト、
+ *     自動作成商品リスト
+ *
+ * 単一 OK ボタンで閉じる。Esc / Enter / 背景クリックでも閉じる。
+ * syncSalesFromCsv の返り値をそのまま渡して使う想定。
+ *
+ * 使い方:
+ *   await showSalesResult({ aborted: false, addedTxns: 3, updatedTxns: 1, ... });
+ */
+(function () {
+  'use strict';
+
+  let salesResultSession = null;
+
+  function esc(value) {
+    if (value === null || value === undefined) return '';
+    return String(value)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;')
+      .replace(/'/g, '&#39;');
+  }
+
+  /** 本文DOMを組み立てる */
+  function renderSalesBody(summary) {
+    const parts = [];
+
+    if (summary && summary.aborted) {
+      const names = Array.isArray(summary.ambiguousNames) ? summary.ambiguousNames : [];
+      parts.push(`<div class="sync-result__abort-banner">`);
+      parts.push(`<strong>取り込みを中止しました</strong>`);
+      parts.push(`CSVの会員名が複数の会員と一致したため、どの会員の売上か特定できませんでした。データベースは変更していません。`);
+      parts.push(`</div>`);
+
+      if (names.length > 0) {
+        parts.push(`<div class="sync-result__section">`);
+        parts.push(`<h3 class="sync-result__section-title">同名の会員が存在する名前（${names.length} 件）</h3>`);
+        parts.push(`<p class="sync-result__section-note">以下の氏名について、会員マスタ内で同姓同名の会員が複数存在します。会員マスタ側で区別できる形にしてから再取り込みしてください。</p>`);
+        parts.push(`<ul class="sync-result__list">`);
+        for (const name of names) {
+          parts.push(
+            `<li class="sync-result__item">` +
+            `<span class="sync-result__item-name">${esc(name)}</span>` +
+            `</li>`
+          );
+        }
+        parts.push(`</ul>`);
+        parts.push(`</div>`);
+      }
+      return parts.join('');
+    }
+
+    const added = summary.addedTxns || 0;
+    const updated = summary.updatedTxns || 0;
+    const addedItems = summary.addedItems || 0;
+    const skippedDup = summary.skippedDupItems || 0;
+    const unresolved = summary.unresolvedPayments || 0;
+    const skippedParse = Array.isArray(summary.skippedParseErrors) ? summary.skippedParseErrors.length : 0;
+    const newMembers = Array.isArray(summary.newMembers) ? summary.newMembers : [];
+    const newProducts = Array.isArray(summary.newProducts) ? summary.newProducts : [];
+
+    /** 6行のカウンタ */
+    parts.push(`<div class="sync-result__counts">`);
+    parts.push(`<div class="sync-result__count-line"><span class="sync-result__count-label">新規取引</span><span class="sync-result__count-value">${added} 件</span></div>`);
+    parts.push(`<div class="sync-result__count-line"><span class="sync-result__count-label">更新取引（既存に合流）</span><span class="sync-result__count-value">${updated} 件</span></div>`);
+    parts.push(`<div class="sync-result__count-line"><span class="sync-result__count-label">明細追加</span><span class="sync-result__count-value">${addedItems} 件</span></div>`);
+    parts.push(`<div class="sync-result__count-line"><span class="sync-result__count-label">重複スキップ</span><span class="sync-result__count-value">${skippedDup} 件</span></div>`);
+    parts.push(`<div class="sync-result__count-line"><span class="sync-result__count-label">未解決の支払方法</span><span class="sync-result__count-value">${unresolved} 件</span></div>`);
+    parts.push(`<div class="sync-result__count-line"><span class="sync-result__count-label">パースエラー</span><span class="sync-result__count-value">${skippedParse} 件</span></div>`);
+    parts.push(`</div>`);
+
+    /** 自動作成会員リスト */
+    if (newMembers.length > 0) {
+      parts.push(`<div class="sync-result__section">`);
+      parts.push(`<h3 class="sync-result__section-title">自動作成した会員（${newMembers.length} 件）</h3>`);
+      parts.push(`<p class="sync-result__section-note">CSVの会員名が会員マスタに見つからなかったため、ウォークイン扱いで自動登録しました。</p>`);
+      parts.push(`<ul class="sync-result__list">`);
+      for (const m of newMembers) {
+        parts.push(
+          `<li class="sync-result__item">` +
+          `<span class="sync-result__item-name">${esc(m.name || '')}</span>` +
+          `<span class="sync-result__item-id">${esc(m.id || '')}</span>` +
+          `</li>`
+        );
+      }
+      parts.push(`</ul>`);
+      parts.push(`</div>`);
+    }
+
+    /** 自動作成商品リスト */
+    if (newProducts.length > 0) {
+      parts.push(`<div class="sync-result__section">`);
+      parts.push(`<h3 class="sync-result__section-title">自動作成した商品（${newProducts.length} 件）</h3>`);
+      parts.push(`<p class="sync-result__section-note">CSVの明細が商品マスタに見つからなかったため、仮登録商品として自動作成しました。必要に応じて商品マスタ画面で修正してください。</p>`);
+      parts.push(`<ul class="sync-result__list">`);
+      for (const p of newProducts) {
+        parts.push(
+          `<li class="sync-result__item">` +
+          `<span class="sync-result__item-name">${esc(p.name || '')}</span>` +
+          `<span class="sync-result__item-code">${esc(p.code || '')}</span>` +
+          `</li>`
+        );
+      }
+      parts.push(`</ul>`);
+      parts.push(`</div>`);
+    }
+
+    return parts.join('');
+  }
+
+  function cleanupSession(session) {
+    session.btnClose.removeEventListener('click', session.handlers.onClose);
+    session.overlay.removeEventListener('click', session.handlers.onOverlay);
+    document.removeEventListener('keydown', session.handlers.onKeyDown);
+    session.overlay.hidden = true;
+    if (session.previouslyFocused && typeof session.previouslyFocused.focus === 'function') {
+      try {
+        session.previouslyFocused.focus();
+      } catch (_) {
+        /* ignore */
+      }
+    }
+  }
+
+  function finishSession(session) {
+    if (salesResultSession !== session) return;
+    salesResultSession = null;
+    cleanupSession(session);
+    session.resolve(undefined);
+  }
+
+  function showSalesResult(summary) {
+    const overlay = document.getElementById('sales-result-overlay');
+    const body = document.getElementById('sales-result-body');
+    const btnClose = document.getElementById('btn-sales-result-close');
+
+    if (!overlay || !body || !btnClose) {
+      console.error('売上明細サマリダイアログのDOMが見つかりません。index.htmlの#sales-result-overlayブロックを確認してください。');
+      return Promise.resolve();
+    }
+
+    if (salesResultSession) {
+      const prev = salesResultSession;
+      salesResultSession = null;
+      cleanupSession(prev);
+      prev.resolve(undefined);
+    }
+
+    body.innerHTML = renderSalesBody(summary || {});
+    overlay.hidden = false;
+
+    const previouslyFocused = document.activeElement;
+
+    return new Promise((resolve) => {
+      const session = {
+        resolve,
+        previouslyFocused,
+        overlay,
+        btnClose,
+        handlers: {}
+      };
+
+      session.handlers.onClose = () => finishSession(session);
+      session.handlers.onOverlay = (event) => {
+        if (event.target === overlay) finishSession(session);
+      };
+      session.handlers.onKeyDown = (event) => {
+        if (event.key === 'Escape' || event.key === 'Enter') {
+          event.preventDefault();
+          finishSession(session);
+        }
+      };
+
+      btnClose.addEventListener('click', session.handlers.onClose);
+      overlay.addEventListener('click', session.handlers.onOverlay);
+      document.addEventListener('keydown', session.handlers.onKeyDown);
+
+      salesResultSession = session;
+      setTimeout(() => btnClose.focus(), 0);
+    });
+  }
+
+  window.showSalesResult = showSalesResult;
+})();

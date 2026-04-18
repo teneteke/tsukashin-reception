@@ -43,6 +43,26 @@ const RESERVATION_COLUMN_ALIASES = {
   date:      ['日付', '予約日', 'date', '来館日']
 };
 
+/**
+ * 売上明細CSV（Phase 18）の列名エイリアス。
+ * SaaS (HiTouch) の売上明細CSVが持つ10列を吸収する。
+ * 必須列（status, sale_date, member_name, item_description）が揃えば
+ * 種別判定が sales ルートに入る。任意列（staff_name, paid_or_refund, remark）は
+ * 取り込めれば使う／なければ空として扱う。
+ */
+const SALES_COLUMN_ALIASES = {
+  status:           ['ステータス', 'status', '状態', '入金ステータス'],
+  sale_date:        ['売上日', '日付', 'date', 'sale_date', '売上日付', '取引日'],
+  member_name:      ['会員名', '氏名', 'name', 'member_name', '顧客名', 'お客様名'],
+  item_description: ['明細', '内容', 'item', 'description', '明細内容', '品名'],
+  sale_category:    ['売上種別', '種別', 'category', 'sale_category', '区分', 'type'],
+  sale_amount:      ['売上金額', '金額', 'amount', 'sale_amount', '売上', '税込金額'],
+  payment_method:   ['支払方法', '決済方法', 'payment', 'payment_method', '決済'],
+  staff_name:       ['担当者', 'staff', 'staff_name', '担当', 'スタッフ'],
+  paid_or_refund:   ['入金/返金', '入金返金', '入返金', 'paid_or_refund', '区分(入返金)'],
+  remark:           ['備考', 'remark', 'remarks', 'note', 'notes', 'メモ']
+};
+
 // ============================================
 // 内部ユーティリティ
 // ============================================
@@ -123,18 +143,25 @@ function headersMatchAliasTable(headers, aliasTable, requiredFields) {
  * CSVのヘッダ行を見て、どの種別の同期に使うかを判定する
  *
  * 判定順:
- *   1. member: id と name がどちらも解決できる（最も識別性が高い）
- *   2. payment: name が解決できる（id は存在しない想定）
- *   3. reservation: member_id が解決できる
- *   4. それ以外は unknown
+ *   1. sales: status + sale_date + member_name + item_description の4列すべて解決できる
+ *      （最も識別性が高い4列必須なので誤判定しにくく、先に判定する）
+ *   2. member: id と name がどちらも解決できる
+ *   3. payment: name が解決できる（id は存在しない想定）
+ *   4. reservation: member_id が解決できる
+ *   5. それ以外は unknown
  *
- * member_id の alias は id を含むため、先に member を判定することで
+ * member_id の alias は id を含むため、member を sales の後かつ reservation の前に判定し、
  * 氏名列を持つ会員CSVが予約CSVに誤分類されるのを防ぐ。
+ * 売上明細CSVは「明細」列を含むため、会員CSV・予約CSVと確実に区別できる。
  *
  * @param {string[]} headers - CSVのヘッダ行
- * @returns {'member'|'payment'|'reservation'|'unknown'}
+ * @returns {'sales'|'member'|'payment'|'reservation'|'unknown'}
  */
 function detectCsvKind(headers) {
+  /** 4列必須の sales を最初に判定することで他種別との衝突を避ける */
+  if (headersMatchAliasTable(headers, SALES_COLUMN_ALIASES, ['status', 'sale_date', 'member_name', 'item_description'])) {
+    return 'sales';
+  }
   if (headersMatchAliasTable(headers, MEMBER_COLUMN_ALIASES, ['id', 'name'])) {
     return 'member';
   }
@@ -662,6 +689,578 @@ async function syncReservationsFromCsv(headers, rows, targetDate) {
 }
 
 // ============================================
+// 売上明細CSV取り込み（Phase 18）
+// ============================================
+
+/**
+ * 売上明細CSVの支払方法エイリアス。
+ * SaaS（HiTouch）が吐き出す文字列揺れを吸収し、payment_methods.name に解決するためのマップ。
+ * 各エントリは [canonical, [aliases...]] 形式で、aliases に含まれる（正規化後の）文字列が来たら
+ * canonical 名を payment_methods.name と照合する。
+ * 現状 3 択（現金/スマホ, ステラ, PayPay）。payment_methods に実際に登録されている行に合わせて
+ * 運用する必要があるため、未解決のときはユーザー側でCSVを使って別途取り込む前提。
+ */
+const SALES_PAYMENT_METHOD_ALIASES = [
+  ['現金/スマホ', ['現金/スマホ', '現金・スマホ', '現金スマホ', '現金', 'cash', '現金・スマ', '現金/スマ']],
+  ['ステラ', ['ステラ', 'stella']],
+  ['PayPay', ['PayPay', 'paypay', 'ペイペイ', 'Paypay', 'PAYPAY']]
+];
+
+/**
+ * 売上明細CSVで自動生成するウォークイン会員IDの正規表現（W-YYYYMMDD-NNN）。
+ * 採番衝突回避のための既存IDパース用。
+ */
+const WALK_IN_ID_PATTERN = /^W-(\d{8})-(\d+)$/;
+
+/**
+ * 売上明細CSVで自動生成する仮登録商品コードの正規表現（Z-NNN）。
+ * 採番衝突回避のための既存コードパース用。
+ */
+const Z_PRODUCT_CODE_PATTERN = /^Z-(\d+)$/;
+
+/**
+ * 氏名・品名・支払方法文字列を突合用の正規形に変換する。
+ * NFKC 正規化（半角カタカナを全角に、全角英数を半角に）→ 前後トリム →
+ * 空白の連続（全角半角含む）を単一の半角スペースに圧縮。
+ * @param {string} raw
+ * @returns {string}
+ */
+function normalizeSalesName(raw) {
+  if (raw === null || raw === undefined) return '';
+  const str = String(raw);
+  /** NFKC 変換は String.prototype.normalize('NFKC') で標準的に行える */
+  const nfkc = str.normalize ? str.normalize('NFKC') : str;
+  return nfkc.trim().replace(/[\s\u3000]+/g, ' ');
+}
+
+/**
+ * 売上日文字列を YYYY-MM-DD に正規化する。
+ * 対応形式:
+ *   - ISO: YYYY-MM-DD（そのまま）
+ *   - スラッシュ区切り: YYYY/MM/DD, YYYY/M/D
+ *   - 日本語: YYYY年MM月DD日, YYYY年M月D日
+ * どれにも当てはまらなければ空文字を返す（呼び出し側でスキップ扱い）。
+ * 全角数字は NFKC で半角に変換してから解釈する。
+ * @param {string} raw
+ * @returns {string} YYYY-MM-DD または ''
+ */
+function parseSalesDate(raw) {
+  if (raw === null || raw === undefined) return '';
+  const s = String(raw).normalize ? String(raw).normalize('NFKC').trim() : String(raw).trim();
+  if (!s) return '';
+  /** ISO dash */
+  let m = /^(\d{4})-(\d{1,2})-(\d{1,2})$/.exec(s);
+  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  /** Slash-separated */
+  m = /^(\d{4})\/(\d{1,2})\/(\d{1,2})$/.exec(s);
+  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  /** Japanese year-month-day */
+  m = /^(\d{4})年(\d{1,2})月(\d{1,2})日$/.exec(s);
+  if (m) return `${m[1]}-${m[2].padStart(2, '0')}-${m[3].padStart(2, '0')}`;
+  return '';
+}
+
+/**
+ * 売上金額文字列を整数（円）に正規化する。
+ * 受け入れ:
+ *   - 数字のみ "1000"
+ *   - 三桁区切りあり "1,000" "1，000"（全角カンマも）
+ *   - 通貨記号プレフィックス "¥1,000" "￥1000"
+ *   - 末尾に "円"
+ * それ以外は NaN を返す（負数・小数も NaN 扱い）。
+ * 全角数字は NFKC で半角に変換してから解釈する。
+ * @param {string} raw
+ * @returns {number} 整数円または NaN
+ */
+function parseSalesAmount(raw) {
+  if (raw === null || raw === undefined) return NaN;
+  let s = String(raw).normalize ? String(raw).normalize('NFKC').trim() : String(raw).trim();
+  if (!s) return NaN;
+  /** 通貨記号・カンマ・円記号を除去 */
+  s = s.replace(/[¥￥]/g, '').replace(/,/g, '').replace(/円$/, '').trim();
+  if (!/^\d+$/.test(s)) return NaN;
+  const n = parseInt(s, 10);
+  return Number.isFinite(n) && n >= 0 ? n : NaN;
+}
+
+/**
+ * 売上明細の支払方法ラベルを、既存 payment_methods.name に解決する。
+ * 1. CSV値を正規化
+ * 2. 正規化済み値が SALES_PAYMENT_METHOD_ALIASES の alias リストに一致するなら、canonical 名で Map を引く
+ * 3. alias に当たらなければ正規化済み値で直接 Map を引く
+ * 4. どちらも当たらなければ null（未解決）
+ * @param {string} raw
+ * @param {Map<string, {id:number, name:string}>} paymentsByKey - normalizedName → payment_methods 行
+ * @returns {{id:number, name:string}|null}
+ */
+function resolveSalesPaymentMethod(raw, paymentsByKey) {
+  if (!raw) return null;
+  const normalized = normalizeSalesName(raw);
+  if (!normalized) return null;
+  for (const [canonical, aliases] of SALES_PAYMENT_METHOD_ALIASES) {
+    for (const alias of aliases) {
+      if (normalizeSalesName(alias) === normalized) {
+        const pm = paymentsByKey.get(normalizeSalesName(canonical));
+        if (pm) return pm;
+      }
+    }
+  }
+  /** エイリアスに当たらないなら CSV 値そのままで直接ルックアップ */
+  const direct = paymentsByKey.get(normalized);
+  return direct || null;
+}
+
+/**
+ * 売上明細CSV行を分類して、DB 書き込みの「計画」を組み立てる純関数。
+ * DB アクセスは一切行わない。呼び出し側が members / products / payment_methods /
+ * 既存ウォークインID / 既存Zコード を全てロード済みで渡す。
+ *
+ * 返り値の txnBuckets は Map で、キーは `${date}|${memberId}` 形式。各バケットが
+ * 1つの transactions 行に対応し、その配下に items 配列を持つ。
+ *
+ * ambiguousNames に値が1つでも入っていれば、呼び出し側は DB に触らず中止する契約。
+ *
+ * @param {Array<Array<string>>} rows - パース済み CSV データ行（ヘッダ除く）
+ * @param {Object<string, number>} columnMap - buildColumnMap の結果
+ * @param {Object} ctx - 外部から注入するリゾルバ用コンテキスト
+ * @param {Map<string, Array<{id:string, name:string}>>} ctx.membersByKey - 正規化氏名 → 会員配列（同名複数時は要素 2+）
+ * @param {Map<string, {code:string, name:string, category:string, price:number}>} ctx.productsByKey - 正規化品名 → 商品
+ * @param {Map<string, {id:number, name:string}>} ctx.paymentsByKey - 正規化決済名 → 決済方法
+ * @param {Array<{id:string}>} ctx.existingWalkIns - 既存 W-* 会員
+ * @param {Array<{code:string}>} ctx.existingZCodes - 既存 Z-* 商品コード
+ * @param {string} ctx.guestMemberId - 非会員擬似会員ID
+ * @param {string} ctx.guestMemberName - 非会員ラベル（CSV値との照合用）
+ * @returns {{
+ *   newMembers: Array<{id:string, name:string}>,
+ *   newProducts: Array<{code:string, name:string, category:string, price:number}>,
+ *   txnBuckets: Map<string, Object>,
+ *   ambiguousNames: string[],
+ *   skippedParseErrors: Array<{rowIndex:number, reason:string, value?:string}>,
+ *   unresolvedPaymentCount: number,
+ *   unresolvedPaymentLabels: string[]
+ * }}
+ */
+function classifySalesRows(rows, columnMap, ctx) {
+  const newMembers = [];
+  const newProducts = [];
+  const txnBuckets = new Map();
+  const ambiguousNames = [];
+  const skippedParseErrors = [];
+  const unresolvedPaymentLabels = [];
+  let unresolvedPaymentCount = 0;
+
+  /** 氏名・品名解決の run-scope キャッシュ。重複CSV行が複数のウォークイン／Zコードを
+   *  生成しないようにするために使う。 */
+  const memberNameCache = new Map();
+  const productNameCache = new Map();
+
+  /** ウォークインID採番の土台（日付ごとの最大連番） */
+  const walkInMaxByDate = new Map();
+  for (const w of ctx.existingWalkIns || []) {
+    const m = WALK_IN_ID_PATTERN.exec(w.id);
+    if (m) {
+      const date = m[1];
+      const seq = parseInt(m[2], 10);
+      walkInMaxByDate.set(date, Math.max(walkInMaxByDate.get(date) || 0, seq));
+    }
+  }
+
+  /** Z 商品コード採番の土台（全期間の最大連番） */
+  let zMax = 0;
+  for (const p of ctx.existingZCodes || []) {
+    const m = Z_PRODUCT_CODE_PATTERN.exec(p.code);
+    if (m) zMax = Math.max(zMax, parseInt(m[1], 10));
+  }
+
+  /** 非会員ラベルの正規形（比較用） */
+  const guestNameNormalized = normalizeSalesName(ctx.guestMemberName || '');
+
+  for (let i = 0; i < rows.length; i++) {
+    const row = rows[i];
+    /** rowIndex はユーザーが Excel で見たときの行番号相当（ヘッダ行 + 1-indexed） */
+    const rowIndex = i + 2;
+
+    const rawStatus = getFieldValue(row, columnMap.status);
+    const rawDate = getFieldValue(row, columnMap.sale_date);
+    const rawMemberName = getFieldValue(row, columnMap.member_name);
+    const rawItemDesc = getFieldValue(row, columnMap.item_description);
+    const rawCategory = getFieldValue(row, columnMap.sale_category);
+    const rawAmount = getFieldValue(row, columnMap.sale_amount);
+    const rawPaymentMethod = getFieldValue(row, columnMap.payment_method);
+    const rawStaffName = getFieldValue(row, columnMap.staff_name);
+    const rawPayRefund = getFieldValue(row, columnMap.paid_or_refund);
+    const rawRemark = getFieldValue(row, columnMap.remark);
+
+    /** 必須4列が空ならスキップ */
+    if (!rawStatus || !rawDate || !rawMemberName || !rawItemDesc) {
+      skippedParseErrors.push({ rowIndex, reason: 'missing-required' });
+      continue;
+    }
+
+    /** 売上日パース */
+    const date = parseSalesDate(rawDate);
+    if (!date) {
+      skippedParseErrors.push({ rowIndex, reason: 'bad-date', value: rawDate });
+      continue;
+    }
+
+    /** 金額パース */
+    const amount = parseSalesAmount(rawAmount);
+    if (!Number.isFinite(amount)) {
+      skippedParseErrors.push({ rowIndex, reason: 'bad-amount', value: rawAmount });
+      continue;
+    }
+
+    /** ステータス → is_received（入金済 のみ 1、それ以外は 0） */
+    const isReceived = String(rawStatus).includes('入金済') ? 1 : 0;
+
+    /** 会員解決 */
+    const normMemberName = normalizeSalesName(rawMemberName);
+    let memberId = null;
+    let memberNameSnapshot = rawMemberName;
+
+    if (normMemberName === guestNameNormalized) {
+      memberId = ctx.guestMemberId;
+      memberNameSnapshot = ctx.guestMemberName;
+    } else if (memberNameCache.has(normMemberName)) {
+      const cached = memberNameCache.get(normMemberName);
+      if (cached === 'AMBIGUOUS') {
+        /** 既にあいまい扱い。中止対象として前段で記録済みなのでここでは足さない */
+        continue;
+      }
+      memberId = cached;
+    } else {
+      const candidates = ctx.membersByKey.get(normMemberName) || [];
+      if (candidates.length === 1) {
+        memberId = candidates[0].id;
+        memberNameCache.set(normMemberName, memberId);
+      } else if (candidates.length >= 2) {
+        ambiguousNames.push(rawMemberName);
+        memberNameCache.set(normMemberName, 'AMBIGUOUS');
+        continue;
+      } else {
+        /** 未登録 → ウォークイン自動作成（日付プレフィックスは当該行の売上日で生成） */
+        const dateCompact = date.replace(/-/g, '');
+        const nextSeq = (walkInMaxByDate.get(dateCompact) || 0) + 1;
+        walkInMaxByDate.set(dateCompact, nextSeq);
+        const walkInId = `W-${dateCompact}-${String(nextSeq).padStart(3, '0')}`;
+        newMembers.push({ id: walkInId, name: rawMemberName });
+        memberId = walkInId;
+        memberNameCache.set(normMemberName, memberId);
+      }
+    }
+
+    /** 商品解決 */
+    const normProdName = normalizeSalesName(rawItemDesc);
+    let productCode;
+    if (productNameCache.has(normProdName)) {
+      productCode = productNameCache.get(normProdName);
+    } else {
+      const existing = ctx.productsByKey.get(normProdName);
+      if (existing) {
+        productCode = existing.code;
+      } else {
+        zMax += 1;
+        productCode = `Z-${String(zMax).padStart(3, '0')}`;
+        newProducts.push({
+          code: productCode,
+          name: rawItemDesc,
+          category: rawCategory || 'その他',
+          price: amount
+        });
+      }
+      productNameCache.set(normProdName, productCode);
+    }
+
+    /** 支払方法解決 */
+    let paymentMethodId = null;
+    if (rawPaymentMethod) {
+      const pm = resolveSalesPaymentMethod(rawPaymentMethod, ctx.paymentsByKey);
+      if (pm) {
+        paymentMethodId = pm.id;
+      } else {
+        unresolvedPaymentCount++;
+        unresolvedPaymentLabels.push(rawPaymentMethod);
+      }
+    }
+
+    /** memo 合成: 備考 | 入金/返金マーカー（パイプ区切り） */
+    const memoParts = [];
+    if (rawRemark) memoParts.push(rawRemark);
+    if (rawPayRefund) memoParts.push(rawPayRefund);
+    const composedMemo = memoParts.length > 0 ? memoParts.join(' | ') : null;
+
+    const staffName = rawStaffName || null;
+
+    /** (date, memberId) バケットへ寄せる */
+    const bucketKey = `${date}|${memberId}`;
+    let bucket = txnBuckets.get(bucketKey);
+    if (!bucket) {
+      bucket = {
+        date,
+        memberId,
+        memberNameSnapshot,
+        isReceived,
+        paymentMethodId,
+        staffName,
+        memo: composedMemo,
+        items: []
+      };
+      txnBuckets.set(bucketKey, bucket);
+    } else {
+      /** 複数行で「入金済」「未入金」が混ざった場合は、入金済を優先して代表値にする。
+       *  payment_method_id も入金済側の値を採用することで整合を保つ。 */
+      if (isReceived === 1 && bucket.isReceived === 0) {
+        bucket.isReceived = 1;
+        bucket.paymentMethodId = paymentMethodId;
+      }
+      /** staff_name は先勝ち。異なる staff が混ざっても上書きしない（plan 上の first-write-wins ルール） */
+      if (!bucket.staffName && staffName) bucket.staffName = staffName;
+      /** memo は既存値があれば維持。同一取引で複数行が備考を持っていたら先勝ち */
+      if (!bucket.memo && composedMemo) bucket.memo = composedMemo;
+    }
+
+    bucket.items.push({
+      productCode,
+      productName: rawItemDesc,
+      price: amount
+    });
+  }
+
+  /** ambiguousNames から重複を除去 */
+  const uniqueAmbiguous = Array.from(new Set(ambiguousNames));
+
+  return {
+    newMembers,
+    newProducts,
+    txnBuckets,
+    ambiguousNames: uniqueAmbiguous,
+    skippedParseErrors,
+    unresolvedPaymentCount,
+    unresolvedPaymentLabels
+  };
+}
+
+/**
+ * 売上明細CSVを取り込む公開関数（T18.6 取り込み実行体）。
+ *
+ * フェーズ:
+ *   1. 事前ロード: 非一時会員 / 有効商品 / 有効決済方法 / 既存W-ID / 既存Z-コード
+ *   2. 分類: classifySalesRows で純粋に計画を作る
+ *   3. ambiguousNames が空でなければ中止（DB書き込みゼロ）
+ *   4. 既存トランザクション/明細を (date, memberId) でルックアップし、バケットに注釈
+ *   5. withTransaction で単一書き込み: 新規会員 → 新規商品 → 取引 INSERT/UPDATE → 明細 INSERT（重複スキップ）
+ *
+ * 返り値:
+ *   aborted=true なら ambiguousNames に該当名のリスト。DB はロールバック済み（書き込みしていない）。
+ *   aborted=false なら各種カウンタと新規作成リスト。
+ *
+ * @param {string[]} headers
+ * @param {Array<Array<string>>} rows
+ * @returns {Promise<{
+ *   aborted:boolean,
+ *   ambiguousNames:string[],
+ *   addedTxns:number,
+ *   updatedTxns:number,
+ *   addedItems:number,
+ *   skippedDupItems:number,
+ *   unresolvedPayments:number,
+ *   unresolvedPaymentLabels:string[],
+ *   skippedParseErrors:Array,
+ *   newMembers:Array<{id:string,name:string}>,
+ *   newProducts:Array<{code:string,name:string,category:string,price:number}>
+ * }>}
+ */
+async function syncSalesFromCsv(headers, rows) {
+  const columnMap = buildColumnMap(headers, SALES_COLUMN_ALIASES);
+
+  if (
+    columnMap.status === -1 ||
+    columnMap.sale_date === -1 ||
+    columnMap.member_name === -1 ||
+    columnMap.item_description === -1
+  ) {
+    throw new Error('売上明細CSVに必須列（ステータス／売上日／会員名／明細）が見つかりませんでした');
+  }
+
+  /** 事前ロード（読み取りのみ、transaction 外） */
+  const memberRows = getNonTemporaryMembersForSalesResolver();
+  const productRows = getActiveProductsForSalesResolver();
+  const paymentRows = dbQuery('SELECT id, name FROM payment_methods WHERE is_active = 1');
+  const existingWalkIns = getExistingWalkInIdsForSalesResolver();
+  const existingZCodes = getExistingZProductCodesForSalesResolver();
+
+  /** 正規化氏名 → 会員配列 の Map（同名複数検知のため配列で保持） */
+  const membersByKey = new Map();
+  for (const m of memberRows) {
+    const key = normalizeSalesName(m.name);
+    if (!key) continue;
+    if (!membersByKey.has(key)) membersByKey.set(key, []);
+    membersByKey.get(key).push(m);
+  }
+
+  /** 正規化品名 → 商品 Map（同名は先勝ち） */
+  const productsByKey = new Map();
+  for (const p of productRows) {
+    const key = normalizeSalesName(p.name);
+    if (!key) continue;
+    if (!productsByKey.has(key)) productsByKey.set(key, p);
+  }
+
+  /** 正規化決済名 → 決済方法 Map */
+  const paymentsByKey = new Map();
+  for (const pm of paymentRows) {
+    const key = normalizeSalesName(pm.name);
+    if (!key) continue;
+    paymentsByKey.set(key, pm);
+  }
+
+  /** 分類 */
+  const plan = classifySalesRows(rows, columnMap, {
+    membersByKey,
+    productsByKey,
+    paymentsByKey,
+    existingWalkIns,
+    existingZCodes,
+    guestMemberId: GUEST_MEMBER_ID,
+    guestMemberName: GUEST_MEMBER_NAME
+  });
+
+  /** 同名衝突があれば DB に触らず中止 */
+  if (plan.ambiguousNames.length > 0) {
+    return {
+      aborted: true,
+      ambiguousNames: plan.ambiguousNames,
+      addedTxns: 0,
+      updatedTxns: 0,
+      addedItems: 0,
+      skippedDupItems: 0,
+      unresolvedPayments: plan.unresolvedPaymentCount,
+      unresolvedPaymentLabels: plan.unresolvedPaymentLabels,
+      skippedParseErrors: plan.skippedParseErrors,
+      newMembers: [],
+      newProducts: []
+    };
+  }
+
+  /** 既存トランザクションを (date, memberId) で引き当て、各バケットに existingTxnId / existingItemKeys を注釈 */
+  const pairs = Array.from(plan.txnBuckets.values()).map((b) => ({
+    date: b.date,
+    memberId: b.memberId
+  }));
+  const { txns: existingTxns, items: existingItems } = getExistingTxnsAndItemsForSales(pairs);
+  const txnIdByKey = new Map();
+  for (const t of existingTxns) {
+    txnIdByKey.set(`${t.date}|${t.member_id}`, t.id);
+  }
+  const itemKeysByTxnId = new Map();
+  for (const it of existingItems) {
+    if (!itemKeysByTxnId.has(it.transaction_id)) itemKeysByTxnId.set(it.transaction_id, new Set());
+    itemKeysByTxnId.get(it.transaction_id).add(
+      `${normalizeSalesName(it.product_name_snapshot)}|${Number(it.price_snapshot)}`
+    );
+  }
+
+  for (const [key, bucket] of plan.txnBuckets) {
+    bucket.existingTxnId = txnIdByKey.get(key) || null;
+    bucket.existingItemKeys = bucket.existingTxnId ? (itemKeysByTxnId.get(bucket.existingTxnId) || new Set()) : new Set();
+  }
+
+  /** 単一トランザクションで書き込みを実行（OPFS 書き込みは commit 後の1回のみ） */
+  const now = getNowISO();
+  let addedTxns = 0;
+  let updatedTxns = 0;
+  let addedItems = 0;
+  let skippedDupItems = 0;
+
+  await withTransaction(async () => {
+    /** 新規ウォークイン会員を先に INSERT（後続の FK 参照を満たすため） */
+    for (const wm of plan.newMembers) {
+      await dbRun(
+        `INSERT INTO members
+         (id, name, name_kana, phone, class, timeslot, is_temporary, memo, created_at, updated_at)
+         VALUES (?, ?, NULL, NULL, NULL, NULL, 1, NULL, ?, ?)`,
+        [wm.id, wm.name, now, now]
+      );
+    }
+
+    /** 新規仮登録商品を INSERT */
+    for (const np of plan.newProducts) {
+      await dbRun(
+        `INSERT INTO products
+         (code, name, category, price, is_provisional, is_active, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 1, 1, ?, ?)`,
+        [np.code, np.name, np.category, np.price, now, now]
+      );
+    }
+
+    /** transactions の INSERT / UPDATE と transaction_items の INSERT */
+    for (const bucket of plan.txnBuckets.values()) {
+      let txnId = bucket.existingTxnId;
+      if (!txnId) {
+        await dbRun(
+          `INSERT INTO transactions
+           (date, member_id, member_name_snapshot, payment_method_id, is_attended, is_received, memo, staff_name, created_at, updated_at)
+           VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
+          [bucket.date, bucket.memberId, bucket.memberNameSnapshot, bucket.paymentMethodId, bucket.isReceived, bucket.memo, bucket.staffName, now, now]
+        );
+        const lastIdRow = dbGetOne('SELECT last_insert_rowid() AS id');
+        txnId = lastIdRow.id;
+        addedTxns++;
+      } else {
+        /** 既存 txn の SaaS 権威フィールドのみ更新（is_received / payment_method_id / staff_name / memo） */
+        await dbRun(
+          `UPDATE transactions
+           SET is_received = ?, payment_method_id = ?, staff_name = ?, memo = ?, updated_at = ?
+           WHERE id = ?`,
+          [bucket.isReceived, bucket.paymentMethodId, bucket.staffName, bucket.memo, now, txnId]
+        );
+        updatedTxns++;
+      }
+
+      /** 明細挿入（重複キー検知） */
+      const knownKeys = new Set(bucket.existingItemKeys);
+      for (const item of bucket.items) {
+        const key = `${normalizeSalesName(item.productName)}|${Number(item.price)}`;
+        if (knownKeys.has(key)) {
+          skippedDupItems++;
+          continue;
+        }
+        await dbRun(
+          `INSERT INTO transaction_items
+           (transaction_id, product_code, product_name_snapshot, price_snapshot, quantity)
+           VALUES (?, ?, ?, ?, 1)`,
+          [txnId, item.productCode, item.productName, item.price]
+        );
+        knownKeys.add(key);
+        addedItems++;
+      }
+    }
+  });
+
+  console.log(
+    `売上明細取り込み完了: 新規取引 ${addedTxns} 件, 更新取引 ${updatedTxns} 件, ` +
+    `明細追加 ${addedItems} 件, 重複スキップ ${skippedDupItems} 件, ` +
+    `未解決決済 ${plan.unresolvedPaymentCount} 件, パースエラー ${plan.skippedParseErrors.length} 件, ` +
+    `新規会員 ${plan.newMembers.length} 件, 新規商品 ${plan.newProducts.length} 件`
+  );
+
+  return {
+    aborted: false,
+    ambiguousNames: [],
+    addedTxns,
+    updatedTxns,
+    addedItems,
+    skippedDupItems,
+    unresolvedPayments: plan.unresolvedPaymentCount,
+    unresolvedPaymentLabels: plan.unresolvedPaymentLabels,
+    skippedParseErrors: plan.skippedParseErrors,
+    newMembers: plan.newMembers,
+    newProducts: plan.newProducts
+  };
+}
+
+// ============================================
 // T5.4 [更新] ボタン（SaaS同期パイプライン）
 // ============================================
 
@@ -741,6 +1340,7 @@ async function runSaasSyncPipeline(files) {
     members: null,
     payments: null,
     reservations: null,
+    sales: null,
     unknownFiles: [],
     errorFiles: []
   };
@@ -765,6 +1365,8 @@ async function runSaasSyncPipeline(files) {
         summary.payments = await syncPaymentMethodsFromCsv(headers, rows);
       } else if (kind === 'reservation') {
         summary.reservations = await syncReservationsFromCsv(headers, rows, typeof getWorkingDate === 'function' ? getWorkingDate() : undefined);
+      } else if (kind === 'sales') {
+        summary.sales = await syncSalesFromCsv(headers, rows);
       } else {
         summary.unknownFiles.push(file.name);
       }
@@ -774,9 +1376,9 @@ async function runSaasSyncPipeline(files) {
     }
   }
 
-  /** T14.5: 会員マスタ / 決済方法 / 未知 / エラーファイルは従来通りのテキストサマリダイアログ。
-   *  予約は専用の構造化ダイアログ（T14.4 showSyncResult）に任せる。
-   *  両方ある場合はテキスト → 予約ダイアログ の順で直列表示する。 */
+  /** T14.5 / T18.8: 会員マスタ / 決済方法 / 未知 / エラーファイルは従来通りのテキストサマリダイアログ。
+   *  予約と売上明細は専用の構造化ダイアログに任せる。
+   *  複数ある場合はテキスト → 予約ダイアログ → 売上明細ダイアログ の順で直列表示する。 */
   const textHasContent =
     !!summary.members ||
     !!summary.payments ||
@@ -798,10 +1400,47 @@ async function runSaasSyncPipeline(files) {
     alert(buildReservationSummaryText(summary.reservations));
   }
 
-  /** 来館者一覧を再描画（新規予約行・クラス/時間枠の変更を反映） */
+  if (summary.sales && typeof window.showSalesResult === 'function') {
+    await window.showSalesResult(summary.sales);
+  } else if (summary.sales) {
+    /** フォールバック: showSalesResult が未ロードの場合はテキストで */
+    alert(buildSalesSummaryText(summary.sales));
+  }
+
+  /** 来館者一覧を再描画（新規予約行・クラス/時間枠の変更・売上取込の新規取引を反映） */
   if (typeof renderVisitorTable === 'function') {
     renderVisitorTable();
   }
+}
+
+/**
+ * 売上明細サマリをテキスト表現するフォールバック（showSalesResult が利用不可な場合のみ使用）
+ * @param {Object} r - syncSalesFromCsv の返り値
+ * @returns {string}
+ */
+function buildSalesSummaryText(r) {
+  const lines = ['売上明細CSV取り込み結果', ''];
+  if (r && r.aborted) {
+    lines.push('取り込みを中止しました。');
+    lines.push('同名の会員が複数存在する氏名があったため、会員マスタ側を確認して再取り込みしてください。');
+    const names = Array.isArray(r.ambiguousNames) ? r.ambiguousNames : [];
+    if (names.length > 0) {
+      lines.push('');
+      lines.push('【あいまいな氏名】');
+      for (const n of names) lines.push(`  - ${n}`);
+    }
+    return lines.join('\n');
+  }
+  lines.push(`新規取引: ${r.addedTxns || 0} 件`);
+  lines.push(`更新取引: ${r.updatedTxns || 0} 件`);
+  lines.push(`明細追加: ${r.addedItems || 0} 件`);
+  lines.push(`重複スキップ: ${r.skippedDupItems || 0} 件`);
+  lines.push(`未解決の支払方法: ${r.unresolvedPayments || 0} 件`);
+  const skippedParse = Array.isArray(r.skippedParseErrors) ? r.skippedParseErrors.length : 0;
+  lines.push(`パースエラー: ${skippedParse} 件`);
+  lines.push(`自動作成会員: ${(r.newMembers || []).length} 件`);
+  lines.push(`自動作成商品: ${(r.newProducts || []).length} 件`);
+  return lines.join('\n');
 }
 
 /**

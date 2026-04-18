@@ -35,6 +35,87 @@ function getMemberName(memberId) {
 }
 
 /**
+ * 売上明細CSV取り込み（Phase 18）用の会員マスタを一括取得する。
+ * 氏名→会員ID解決のためのリゾルバが name だけで十分なので、
+ * is_temporary=0 の行だけを id と name に絞ってロードする。
+ * 非一時会員に限定することで、GUEST 擬似会員や過去のウォークインが
+ * 同姓同名判定に混入するのを避ける（GUEST 解決は別経路で行う）。
+ * @returns {Array<{id:string, name:string}>}
+ */
+function getNonTemporaryMembersForSalesResolver() {
+  return dbQuery(
+    'SELECT id, name FROM members WHERE is_temporary = 0'
+  );
+}
+
+/**
+ * 売上明細CSV取り込み（Phase 18）用の有効商品マスタを一括取得する。
+ * 品名→商品コード解決のために name と category / price が必要。
+ * @returns {Array<{code:string, name:string, category:string, price:number}>}
+ */
+function getActiveProductsForSalesResolver() {
+  return dbQuery(
+    'SELECT code, name, category, price FROM products WHERE is_active = 1'
+  );
+}
+
+/**
+ * 売上明細CSV取り込み（Phase 18）で既存のウォークイン会員IDを一括取得する。
+ * W-YYYYMMDD-NNN の採番衝突回避のため、既存の最大連番を拾うのに使う。
+ * @returns {Array<{id:string}>}
+ */
+function getExistingWalkInIdsForSalesResolver() {
+  return dbQuery(
+    "SELECT id FROM members WHERE id LIKE 'W-%'"
+  );
+}
+
+/**
+ * 売上明細CSV取り込み（Phase 18）で既存の Z-プレフィックス商品コードを一括取得する。
+ * Z-NNN の連番採番衝突回避のため、既存の最大連番を拾うのに使う。
+ * @returns {Array<{code:string}>}
+ */
+function getExistingZProductCodesForSalesResolver() {
+  return dbQuery(
+    "SELECT code FROM products WHERE code LIKE 'Z-%'"
+  );
+}
+
+/**
+ * 売上明細CSV取り込み（Phase 18）で既存トランザクションと明細を一括取得する。
+ * 取込計画が確定した後、どのバケットが新規・既存かを判定するために使う。
+ * @param {Array<{date:string, memberId:string}>} pairs - 取込対象の (date, memberId) リスト
+ * @returns {{txns:Array<{id:number, date:string, member_id:string}>, items:Array<{transaction_id:number, product_name_snapshot:string, price_snapshot:number}>}}
+ */
+function getExistingTxnsAndItemsForSales(pairs) {
+  if (!Array.isArray(pairs) || pairs.length === 0) {
+    return { txns: [], items: [] };
+  }
+  /** date と member_id の2軸で絞り込むため、IN (...) 2本の AND で取得する。
+   *  pair 数が多い場合でも、date と member_id 各々の基数は高くならない想定（多くても数十）。 */
+  const dateSet = new Set(pairs.map((p) => p.date));
+  const memberSet = new Set(pairs.map((p) => p.memberId));
+  const dates = Array.from(dateSet);
+  const members = Array.from(memberSet);
+  const datePlaceholders = dates.map(() => '?').join(',');
+  const memberPlaceholders = members.map(() => '?').join(',');
+  const txns = dbQuery(
+    `SELECT id, date, member_id FROM transactions
+     WHERE date IN (${datePlaceholders}) AND member_id IN (${memberPlaceholders})`,
+    [...dates, ...members]
+  );
+  if (txns.length === 0) return { txns, items: [] };
+  const txnIds = txns.map((t) => t.id);
+  const itemPlaceholders = txnIds.map(() => '?').join(',');
+  const items = dbQuery(
+    `SELECT transaction_id, product_name_snapshot, price_snapshot
+     FROM transaction_items WHERE transaction_id IN (${itemPlaceholders})`,
+    txnIds
+  );
+  return { txns, items };
+}
+
+/**
  * 会員を検索する（ID / 電話番号 / カタカナ名で統合検索）
  * @param {string} query - 検索文字列
  * @param {number} limit - 最大件数

@@ -1688,6 +1688,32 @@ button {
   gap: var(--sp-2);
 }
 
+/* 売上明細CSV取り込みサマリで使う追加スタイル（Phase 18 T18.7）。
+ * 同名衝突で全体中止になったときの警告バナーを目立たせる。 */
+.sync-result__abort-banner {
+  padding: var(--sp-3);
+  margin-bottom: var(--sp-3);
+  background: var(--surface-warning, #fef3c7);
+  border: 1px solid var(--warning, #f59e0b);
+  border-radius: var(--radius-sm);
+  color: var(--text-primary);
+  font: var(--text-body);
+  line-height: var(--lh-normal);
+}
+
+.sync-result__abort-banner strong {
+  display: block;
+  margin-bottom: var(--sp-1);
+  color: var(--warning);
+}
+
+.sync-result__item-code {
+  font: var(--text-mono-small, var(--text-small));
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+  margin-left: auto;
+}
+
 /* ==========================================================================
  * Section 21: Phase 15 — ストレージ使用量表示
  * ========================================================================== */

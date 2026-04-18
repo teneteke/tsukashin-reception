@@ -376,6 +376,17 @@
     </div>
   </div>
 
+  <!-- 売上明細CSV取り込み結果ダイアログ（Phase 18 T18.7） -->
+  <div id="sales-result-overlay" class="dialog-overlay" hidden>
+    <div class="dialog" role="dialog" aria-labelledby="sales-result-title" aria-modal="true">
+      <h2 id="sales-result-title" class="section-title section-title--compact">売上明細CSV取り込み結果</h2>
+      <div id="sales-result-body" class="sync-result__body"></div>
+      <div class="sync-result__actions">
+        <button type="button" id="btn-sales-result-close" class="btn btn--primary">OK</button>
+      </div>
+    </div>
+  </div>
+
   <!-- 予約CSV取り込み結果ダイアログ（Phase 14 T14.4） -->
   <div id="sync-result-overlay" class="dialog-overlay" hidden>
     <div class="dialog" role="dialog" aria-labelledby="sync-result-title" aria-modal="true">
@@ -396,6 +407,7 @@
         <li>会員マスタ</li>
         <li>決済方法</li>
         <li>予約リスト</li>
+        <li>売上明細</li>
       </ul>
       <p class="sync-intro__note">※ファイルの種類は自動で判別されます。</p>
       <div class="sync-intro__actions">

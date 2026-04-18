@@ -993,3 +993,244 @@ describe('Phase 15 repository functions observed behavior for ill-formed targetD
     expect(txn[0].date).toBe('bad-date-str');
   });
 });
+
+// ==========================================================================
+// Phase 18: Sales-detail CSV import end-to-end
+// ==========================================================================
+
+describe('Phase 18: syncSalesFromCsv end-to-end', () => {
+  /** Bring the DB up to schema V2 (staff_name column + GUEST seed) before
+   *  each sales-import test. Without this the sales executor cannot write
+   *  the staff_name column and the GUEST pseudo-member is absent. */
+  beforeEach(() => {
+    globalThis.migrations[2]();
+  });
+
+  /** Seed helpers so tests start from a known member / product / payment baseline. */
+  function seedMembers() {
+    insertMember({ id: 'T-0001', name: '山田 太郎', is_temporary: 0 });
+    insertMember({ id: 'T-0002', name: '佐藤 花子', is_temporary: 0 });
+  }
+
+  function seedDuplicateNames() {
+    insertMember({ id: 'D-0001', name: '同名 太郎', is_temporary: 0 });
+    insertMember({ id: 'D-0002', name: '同名 太郎', is_temporary: 0 });
+  }
+
+  /** Seed payment_methods to match what sales CSV will reference. */
+  function seedSalesPaymentMethods() {
+    /** seedData already inserted 現金 / PayPay / カード. Add 現金/スマホ and ステラ
+     *  explicitly so the sales resolver can bind. Leave seeded methods in place. */
+    globalThis.db.run(
+      `INSERT INTO payment_methods (name, is_active, sort_order) VALUES ('現金/スマホ', 1, 10)`
+    );
+    globalThis.db.run(
+      `INSERT INTO payment_methods (name, is_active, sort_order) VALUES ('ステラ', 1, 11)`
+    );
+  }
+
+  /** Header row used for every sales CSV in these tests. */
+  const HEADERS = ['ステータス', '売上日', '会員名', '明細', '売上種別', '売上金額', '支払方法', '担当者', '入金/返金', '備考'];
+
+  function buildRow(status, date, name, item, category, amount, pay, staff, paidOrRefund, remark) {
+    return [status, date, name, item, category, String(amount), pay || '', staff || '', paidOrRefund || '', remark || ''];
+  }
+
+  it('imports a mixed CSV covering every summary counter on the happy path', async () => {
+    seedMembers();
+    seedSalesPaymentMethods();
+    const rows = [
+      /** Known member, existing product (binds 001 体験レッスン) */
+      buildRow('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '平野 智子', '2026-04-18', ''),
+      /** Guest (non-member) row, known product */
+      buildRow('入金済', '2026-04-18', '非会員', '体験レッスン', '販売商品', 1000, '現金/スマホ', '平野 智子', '2026-04-18', 'ウォークイン対応'),
+      /** Unpaid row with unresolved payment method (empty) — counts as a transaction with no payment method */
+      buildRow('未入金', '2026-04-18', '佐藤 花子', '振替手数料', '振替手数料', 100, '', '野開 佳子', '', ''),
+      /** Second item for 山田 太郎 — same bucket */
+      buildRow('入金済', '2026-04-18', '山田 太郎', 'ボール(1缶)', '販売商品', 800, '現金/スマホ', '平野 智子', '2026-04-18', ''),
+      /** Unknown member + unknown product → walk-in + Z-001 */
+      buildRow('入金済', '2026-04-18', '新規 太郎', 'コキュージュニアラケット', '販売商品', 4455, 'ステラ', '野開 佳子', '2026-04-18', 'ジュニア用'),
+      /** Unknown payment method — counts as unresolved and leaves txn.payment_method_id NULL */
+      buildRow('入金済', '2026-04-19', '山田 太郎', '振替手数料', '振替手数料', 100, 'Apple Pay', '', '', '')
+    ];
+
+    const result = await globalThis.syncSalesFromCsv(HEADERS, rows);
+
+    expect(result.aborted).toBe(false);
+    /** 4 distinct (date, member) buckets: 山田/04-18, GUEST/04-18, 佐藤/04-18, 新規太郎walkin/04-18, 山田/04-19 = 5 */
+    expect(result.addedTxns).toBe(5);
+    expect(result.updatedTxns).toBe(0);
+    /** 6 CSV rows → 6 items INSERTed (all new, no duplicates pre-existed) */
+    expect(result.addedItems).toBe(6);
+    expect(result.skippedDupItems).toBe(0);
+    /** One unresolved payment: 'Apple Pay' on the last row */
+    expect(result.unresolvedPayments).toBe(1);
+    expect(result.unresolvedPaymentLabels).toContain('Apple Pay');
+    /** One walk-in member was auto-created */
+    expect(result.newMembers).toHaveLength(1);
+    expect(result.newMembers[0].id).toMatch(/^W-20260418-/);
+    /** Two Z-coded products were auto-created: 振替手数料 (first-seen in row 3) and
+     *  コキュージュニアラケット (first-seen in row 5). Row 6's 振替手数料 reuses Z-001
+     *  via the run-scope product cache and does not create a third Z-code. */
+    expect(result.newProducts).toHaveLength(2);
+    const zCodes = result.newProducts.map((p) => p.code).sort();
+    expect(zCodes).toEqual(['Z-001', 'Z-002']);
+
+    /** Verify DB state: 5 transactions, 6 items, GUEST member exists, walk-in exists */
+    const txns = globalThis.dbQuery('SELECT * FROM transactions ORDER BY id ASC');
+    expect(txns.length).toBe(5);
+    const items = globalThis.dbQuery('SELECT * FROM transaction_items ORDER BY id ASC');
+    expect(items.length).toBe(6);
+    const guestTxn = globalThis.dbQuery(
+      "SELECT member_name_snapshot, is_received FROM transactions WHERE member_id = 'GUEST'"
+    );
+    expect(guestTxn).toHaveLength(1);
+    expect(guestTxn[0].member_name_snapshot).toBe('非会員');
+    const walkInMember = globalThis.dbQuery(
+      "SELECT name FROM members WHERE id = ?",
+      [result.newMembers[0].id]
+    );
+    expect(walkInMember).toHaveLength(1);
+    expect(walkInMember[0].name).toBe('新規 太郎');
+    /** Apple-Pay row has payment_method_id NULL */
+    const appleTxn = globalThis.dbQuery(
+      "SELECT payment_method_id, is_received FROM transactions WHERE member_id = 'T-0001' AND date = '2026-04-19'"
+    );
+    expect(appleTxn[0].payment_method_id).toBe(null);
+    expect(appleTxn[0].is_received).toBe(1);
+    /** staff_name is recorded */
+    const yamadaTxn = globalThis.dbQuery(
+      "SELECT staff_name FROM transactions WHERE member_id = 'T-0001' AND date = '2026-04-18'"
+    );
+    expect(yamadaTxn[0].staff_name).toBe('平野 智子');
+  });
+
+  it('is idempotent: a second import with the same CSV adds zero transactions and zero items', async () => {
+    seedMembers();
+    seedSalesPaymentMethods();
+    const rows = [
+      buildRow('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '平野', '', ''),
+      buildRow('入金済', '2026-04-18', '山田 太郎', 'ボール(1缶)', '販売商品', 800, '現金/スマホ', '平野', '', '')
+    ];
+
+    const first = await globalThis.syncSalesFromCsv(HEADERS, rows);
+    expect(first.addedTxns).toBe(1);
+    expect(first.addedItems).toBe(2);
+
+    const second = await globalThis.syncSalesFromCsv(HEADERS, rows);
+    expect(second.addedTxns).toBe(0);
+    expect(second.updatedTxns).toBe(1);
+    expect(second.addedItems).toBe(0);
+    expect(second.skippedDupItems).toBe(2);
+
+    /** DB state unchanged */
+    const txns = globalThis.dbQuery('SELECT COUNT(*) AS n FROM transactions');
+    expect(txns[0].n).toBe(1);
+    const items = globalThis.dbQuery('SELECT COUNT(*) AS n FROM transaction_items');
+    expect(items[0].n).toBe(2);
+  });
+
+  it('merges SaaS-authoritative fields on an existing (date, member) transaction without overwriting attendance', async () => {
+    seedMembers();
+    seedSalesPaymentMethods();
+
+    /** Pre-existing local transaction: attendance is 1, received is 0, no staff_name */
+    insertTransaction({
+      date: '2026-04-18',
+      member_id: 'T-0001',
+      member_name_snapshot: '山田 太郎',
+      is_attended: 1,
+      is_received: 0,
+      memo: 'reception note'
+    });
+
+    const rows = [
+      buildRow('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '平野 智子', '2026-04-18', 'CSV remark')
+    ];
+    const result = await globalThis.syncSalesFromCsv(HEADERS, rows);
+
+    expect(result.aborted).toBe(false);
+    expect(result.updatedTxns).toBe(1);
+    expect(result.addedItems).toBe(1);
+
+    /** is_attended stays untouched (not SaaS-authoritative); is_received is now 1;
+     *  staff_name and memo are now from the CSV. */
+    const txn = globalThis.dbGetOne(
+      "SELECT is_attended, is_received, staff_name, memo FROM transactions WHERE member_id = 'T-0001' AND date = '2026-04-18'"
+    );
+    expect(txn.is_attended).toBe(1);
+    expect(txn.is_received).toBe(1);
+    expect(txn.staff_name).toBe('平野 智子');
+    expect(txn.memo).toBe('CSV remark | 2026-04-18');
+  });
+
+  it('aborts the whole import when two non-temporary members share a normalized name', async () => {
+    seedMembers();
+    seedDuplicateNames();
+    seedSalesPaymentMethods();
+
+    const rows = [
+      /** Non-ambiguous row first — if the abort policy is correct, even this row is NOT written */
+      buildRow('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '', '', ''),
+      /** Ambiguous row */
+      buildRow('入金済', '2026-04-18', '同名 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '', '', '')
+    ];
+
+    const result = await globalThis.syncSalesFromCsv(HEADERS, rows);
+
+    expect(result.aborted).toBe(true);
+    expect(result.ambiguousNames).toEqual(['同名 太郎']);
+    expect(result.addedTxns).toBe(0);
+    expect(result.addedItems).toBe(0);
+
+    /** DB untouched */
+    const txns = globalThis.dbQuery('SELECT COUNT(*) AS n FROM transactions');
+    expect(txns[0].n).toBe(0);
+    const items = globalThis.dbQuery('SELECT COUNT(*) AS n FROM transaction_items');
+    expect(items[0].n).toBe(0);
+  });
+
+  it('emits exactly one saveToOPFS write on the happy path (single-transaction guarantee)', async () => {
+    seedMembers();
+    seedSalesPaymentMethods();
+
+    let saveCount = 0;
+    globalThis.saveToOPFS = async () => { saveCount++; };
+
+    const rows = [
+      buildRow('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '', '', ''),
+      buildRow('入金済', '2026-04-18', '山田 太郎', 'ボール(1缶)', '販売商品', 800, '現金/スマホ', '', '', ''),
+      buildRow('入金済', '2026-04-19', '佐藤 花子', '体験レッスン', '販売商品', 1100, 'ステラ', '', '', '')
+    ];
+    await globalThis.syncSalesFromCsv(HEADERS, rows);
+
+    expect(saveCount).toBe(1);
+  });
+
+  it('emits zero saveToOPFS writes on the aborted path', async () => {
+    seedMembers();
+    seedDuplicateNames();
+    seedSalesPaymentMethods();
+
+    let saveCount = 0;
+    globalThis.saveToOPFS = async () => { saveCount++; };
+
+    const rows = [buildRow('入金済', '2026-04-18', '同名 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '', '', '')];
+    const result = await globalThis.syncSalesFromCsv(HEADERS, rows);
+
+    expect(result.aborted).toBe(true);
+    expect(saveCount).toBe(0);
+  });
+
+  it('creates the schema V2 staff_name column and the GUEST pseudo-member via migrations[2]', async () => {
+    /** The migration runs in the describe-level beforeEach. Confirm its effects directly. */
+    const cols = globalThis.dbQuery("PRAGMA table_info('transactions')");
+    const colNames = cols.map((c) => c.name);
+    expect(colNames).toContain('staff_name');
+
+    const guest = globalThis.dbGetOne('SELECT id, name, is_temporary FROM members WHERE id = ?', ['GUEST']);
+    expect(guest).toBeTruthy();
+    expect(guest.name).toBe('非会員');
+    expect(guest.is_temporary).toBe(1);
+  });
+});
