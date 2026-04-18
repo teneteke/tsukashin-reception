@@ -150,27 +150,42 @@ describe('parseSalesAmount', () => {
 });
 
 describe('resolveSalesPaymentMethod', () => {
+  /** Phase 19: canonical は 4 種（現金 / 現金・スマホ / PayPay / ステラ）。
+   *   payment_methods マスタ側が「現金」と「現金・スマホ」を別レコードとして持つ運用を想定。 */
   const paymentsByKey = new Map([
-    [globalThis.normalizeSalesName('現金/スマホ'), { id: 1, name: '現金/スマホ' }],
-    [globalThis.normalizeSalesName('ステラ'), { id: 2, name: 'ステラ' }],
-    [globalThis.normalizeSalesName('PayPay'), { id: 3, name: 'PayPay' }]
+    [globalThis.normalizeSalesName('現金'), { id: 1, name: '現金' }],
+    [globalThis.normalizeSalesName('現金・スマホ'), { id: 2, name: '現金・スマホ' }],
+    [globalThis.normalizeSalesName('PayPay'), { id: 3, name: 'PayPay' }],
+    [globalThis.normalizeSalesName('ステラ'), { id: 4, name: 'ステラ' }]
   ]);
 
-  it('resolves the canonical cash-and-smartphone label', () => {
+  it('resolves plain cash as its own canonical', () => {
+    const r = globalThis.resolveSalesPaymentMethod('現金', paymentsByKey);
+    expect(r && r.id).toBe(1);
+  });
+
+  it('resolves the canonical cash-and-smartphone label (middle-dot form)', () => {
+    const r = globalThis.resolveSalesPaymentMethod('現金・スマホ', paymentsByKey);
+    expect(r && r.id).toBe(2);
+  });
+
+  it('resolves the slash form 現金/スマホ to the middle-dot canonical', () => {
     const r = globalThis.resolveSalesPaymentMethod('現金/スマホ', paymentsByKey);
-    expect(r && r.id).toBe(1);
+    expect(r && r.id).toBe(2);
   });
 
-  it('resolves truncated cash-and-smartphone alias to the canonical row', () => {
+  it('resolves truncated cash-and-smartphone alias to the cash-and-smartphone canonical', () => {
     const r = globalThis.resolveSalesPaymentMethod('現金・スマ', paymentsByKey);
-    expect(r && r.id).toBe(1);
+    expect(r && r.id).toBe(2);
   });
 
-  it('resolves Stella in both Japanese and Roman spellings', () => {
+  it('resolves Stella in Japanese and Roman spellings', () => {
     const a = globalThis.resolveSalesPaymentMethod('ステラ', paymentsByKey);
     const b = globalThis.resolveSalesPaymentMethod('stella', paymentsByKey);
-    expect(a && a.id).toBe(2);
-    expect(b && b.id).toBe(2);
+    const c = globalThis.resolveSalesPaymentMethod('STELLA', paymentsByKey);
+    expect(a && a.id).toBe(4);
+    expect(b && b.id).toBe(4);
+    expect(c && c.id).toBe(4);
   });
 
   it('resolves PayPay in multiple casings', () => {
@@ -203,10 +218,12 @@ describe('classifySalesRows', () => {
       [globalThis.normalizeSalesName('体験レッスン'), { code: '001', name: '体験レッスン', category: 'レッスン', price: 1100 }],
       [globalThis.normalizeSalesName('ボール(1缶)'), { code: '021', name: 'ボール(1缶)', category: '商品', price: 800 }]
     ]);
+    /** Phase 19 canonical 4 種: 現金 / 現金・スマホ / PayPay / ステラ */
     const paymentsByKey = overrides.paymentsByKey || new Map([
-      [globalThis.normalizeSalesName('現金/スマホ'), { id: 1, name: '現金/スマホ' }],
-      [globalThis.normalizeSalesName('ステラ'), { id: 2, name: 'ステラ' }],
-      [globalThis.normalizeSalesName('PayPay'), { id: 3, name: 'PayPay' }]
+      [globalThis.normalizeSalesName('現金'), { id: 1, name: '現金' }],
+      [globalThis.normalizeSalesName('現金・スマホ'), { id: 2, name: '現金・スマホ' }],
+      [globalThis.normalizeSalesName('PayPay'), { id: 3, name: 'PayPay' }],
+      [globalThis.normalizeSalesName('ステラ'), { id: 4, name: 'ステラ' }]
     ]);
     return {
       membersByKey,
@@ -238,18 +255,18 @@ describe('classifySalesRows', () => {
   }
 
   it('resolves a unique known member to the existing member id', () => {
-    const rows = [row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '平野 智子', '', '')];
+    const rows = [row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金・スマホ', '平野 智子', '', '')];
     const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
     expect(plan.ambiguousNames).toEqual([]);
     expect(plan.newMembers).toEqual([]);
     const bucket = Array.from(plan.txnBuckets.values())[0];
     expect(bucket.memberId).toBe('T-0001');
     expect(bucket.isReceived).toBe(1);
-    expect(bucket.paymentMethodId).toBe(1);
+    expect(bucket.paymentMethodId).toBe(2);
   });
 
   it('binds the non-member label to the guest pseudo-member id', () => {
-    const rows = [row('入金済', '2026-04-18', '非会員', '体験レッスン', '販売商品', 1000, '現金/スマホ', '平野 智子', '', '')];
+    const rows = [row('入金済', '2026-04-18', '非会員', '体験レッスン', '販売商品', 1000, '現金・スマホ', '平野 智子', '', '')];
     const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
     const bucket = Array.from(plan.txnBuckets.values())[0];
     expect(bucket.memberId).toBe('GUEST');
@@ -259,8 +276,8 @@ describe('classifySalesRows', () => {
 
   it('creates a walk-in member for an unknown name and reuses it on subsequent rows', () => {
     const rows = [
-      row('入金済', '2026-04-18', '新規 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '平野', '', ''),
-      row('入金済', '2026-04-18', '新規 太郎', 'ボール(1缶)', '販売商品', 800, '現金/スマホ', '平野', '', '')
+      row('入金済', '2026-04-18', '新規 太郎', '体験レッスン', '販売商品', 1100, '現金・スマホ', '平野', '', ''),
+      row('入金済', '2026-04-18', '新規 太郎', 'ボール(1缶)', '販売商品', 800, '現金・スマホ', '平野', '', '')
     ];
     const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
     expect(plan.newMembers).toHaveLength(1);
@@ -298,15 +315,15 @@ describe('classifySalesRows', () => {
         ]]
       ])
     });
-    const rows = [row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '', '', '')];
+    const rows = [row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金・スマホ', '', '', '')];
     const plan = globalThis.classifySalesRows(rows, columnMap, ctx);
     expect(plan.ambiguousNames).toEqual(['山田 太郎']);
   });
 
   it('groups rows with the same (date, member) into one bucket with multiple items', () => {
     const rows = [
-      row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '平野', '', ''),
-      row('入金済', '2026-04-18', '山田 太郎', 'ボール(1缶)', '販売商品', 800, '現金/スマホ', '平野', '', '')
+      row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金・スマホ', '平野', '', ''),
+      row('入金済', '2026-04-18', '山田 太郎', 'ボール(1缶)', '販売商品', 800, '現金・スマホ', '平野', '', '')
     ];
     const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
     expect(plan.txnBuckets.size).toBe(1);
@@ -314,28 +331,20 @@ describe('classifySalesRows', () => {
     expect(bucket.items).toHaveLength(2);
   });
 
-  it('prefers an is_received=1 row over is_received=0 when both target the same bucket', () => {
+  it('counts unresolved payment methods only on paid rows', () => {
+    /** Phase 19: 未入金行では payment の解決を試みない（未解決カウントに入らない） */
     const rows = [
-      row('未入金', '2026-04-18', '山田 太郎', '振替手数料', '振替手数料', 100, '', '', '', ''),
-      row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '平野', '', '')
+      row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '謎ペイ', '平野', '', ''),
+      row('未入金', '2026-04-18', '佐藤 花子', '振替手数料', '振替手数料', 100, '現金', '野開', '', '')
     ];
     const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
-    const bucket = Array.from(plan.txnBuckets.values())[0];
-    expect(bucket.isReceived).toBe(1);
-    expect(bucket.paymentMethodId).toBe(1);
-  });
-
-  it('counts unresolved payment methods without aborting', () => {
-    const rows = [row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '謎ペイ', '', '', '')];
-    const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
+    /** 入金済の '謎ペイ' のみ未解決扱い（1件）。未入金行の '現金' は無視されるので 0 件扱い。 */
     expect(plan.unresolvedPaymentCount).toBe(1);
     expect(plan.unresolvedPaymentLabels).toContain('謎ペイ');
-    const bucket = Array.from(plan.txnBuckets.values())[0];
-    expect(bucket.paymentMethodId).toBe(null);
   });
 
   it('skips rows with a bad date and records the skip reason', () => {
-    const rows = [row('入金済', 'not a date', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '', '', '')];
+    const rows = [row('入金済', 'not a date', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金・スマホ', '', '', '')];
     const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
     expect(plan.txnBuckets.size).toBe(0);
     expect(plan.skippedParseErrors).toHaveLength(1);
@@ -343,31 +352,87 @@ describe('classifySalesRows', () => {
   });
 
   it('skips rows with a bad amount', () => {
-    const rows = [row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 'N/A', '現金/スマホ', '', '', '')];
+    const rows = [row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 'N/A', '現金・スマホ', '', '', '')];
     const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
     expect(plan.txnBuckets.size).toBe(0);
     expect(plan.skippedParseErrors[0].reason).toBe('bad-amount');
   });
 
-  it('composes remark and paid-or-refund into the memo with a pipe separator', () => {
-    const rows = [row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '', '2026-04-18', 'ジュニア用')];
+  /** ---------------------- Phase 19 新規テスト ---------------------- */
+
+  it('paid-status row yields bucket with is_received=1, is_attended=1, payment and staff populated', () => {
+    const rows = [row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金・スマホ', '平野 智子', '', '')];
     const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
     const bucket = Array.from(plan.txnBuckets.values())[0];
-    expect(bucket.memo).toBe('ジュニア用 | 2026-04-18');
+    expect(bucket.isReceived).toBe(1);
+    expect(bucket.isAttended).toBe(1);
+    expect(bucket.paymentMethodId).toBe(2);
+    expect(bucket.staffName).toBe('平野 智子');
   });
 
-  it('leaves memo null when both remark and paid-or-refund are empty', () => {
-    const rows = [row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '', '', '')];
+  it('unpaid-status row clears payment and staff even when CSV populates them', () => {
+    /** SaaS は未入金行でも「現金」「担当者」をデフォルトで書いてくる。
+     *   Phase 19 はそれらを信用せず、強制的に null / 0 に落とす。 */
+    const rows = [row('未入金', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金', 'ダミー担当', '', '')];
     const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
     const bucket = Array.from(plan.txnBuckets.values())[0];
-    expect(bucket.memo).toBe(null);
+    expect(bucket.isReceived).toBe(0);
+    expect(bucket.isAttended).toBe(0);
+    expect(bucket.paymentMethodId).toBe(null);
+    expect(bucket.staffName).toBe(null);
+  });
+
+  it('mixed-status bucket: one paid row lifts the whole bucket into paid state', () => {
+    const rows = [
+      row('未入金', '2026-04-18', '山田 太郎', '振替手数料', '振替手数料', 100, '現金', '', '', ''),
+      row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, 'PayPay', '平野 智子', '', '')
+    ];
+    const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
+    const bucket = Array.from(plan.txnBuckets.values())[0];
+    expect(bucket.isReceived).toBe(1);
+    expect(bucket.isAttended).toBe(1);
+    expect(bucket.paymentMethodId).toBe(3); // PayPay
+    expect(bucket.staffName).toBe('平野 智子');
+    /** 両方の明細が同じバケットに集約される */
+    expect(bucket.items).toHaveLength(2);
+  });
+
+  it('attaches remark to per-item note field (not to transaction memo)', () => {
+    const rows = [
+      row('入金済', '2026-04-18', '山田 太郎', 'テニス 商品', '販売商品', 4455, 'ステラ', '野開', '', 'コキュージュニアラケット'),
+      row('入金済', '2026-04-18', '山田 太郎', 'テニス 商品', '販売商品', 5808, 'ステラ', '野開', '', 'ヨネックスジュニアシューズ')
+    ];
+    const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
+    const bucket = Array.from(plan.txnBuckets.values())[0];
+    /** bucket.memo は存在しない／null（CSV から書かない） */
+    expect(bucket.memo).toBeUndefined();
+    /** 各 item が自身の note を持つ */
+    expect(bucket.items).toHaveLength(2);
+    expect(bucket.items[0].note).toBe('コキュージュニアラケット');
+    expect(bucket.items[1].note).toBe('ヨネックスジュニアシューズ');
+  });
+
+  it('leaves item.note as null when the remark column is empty', () => {
+    const rows = [row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金・スマホ', '', '', '')];
+    const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
+    const bucket = Array.from(plan.txnBuckets.values())[0];
+    expect(bucket.items[0].note).toBe(null);
+  });
+
+  it('ignores the paid-or-refund column entirely (not persisted to bucket)', () => {
+    const rows = [row('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金・スマホ', '', '2026-04-18', '')];
+    const plan = globalThis.classifySalesRows(rows, columnMap, buildContext());
+    const bucket = Array.from(plan.txnBuckets.values())[0];
+    /** 入金/返金日の情報はバケットにも item にも現れない */
+    expect(bucket.memo).toBeUndefined();
+    expect(bucket.items[0].note).toBe(null);
   });
 
   it('walks-in generator continues from the existing walk-in max sequence', () => {
     const ctx = buildContext({
       existingWalkIns: [{ id: 'W-20260418-001' }, { id: 'W-20260418-005' }]
     });
-    const rows = [row('入金済', '2026-04-18', '全く新しい人', '体験レッスン', '販売商品', 1100, '現金/スマホ', '', '', '')];
+    const rows = [row('入金済', '2026-04-18', '全く新しい人', '体験レッスン', '販売商品', 1100, '現金・スマホ', '', '', '')];
     const plan = globalThis.classifySalesRows(rows, columnMap, ctx);
     expect(plan.newMembers[0].id).toBe('W-20260418-006');
   });

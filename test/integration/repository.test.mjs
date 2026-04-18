@@ -999,11 +999,13 @@ describe('Phase 15 repository functions observed behavior for ill-formed targetD
 // ==========================================================================
 
 describe('Phase 18: syncSalesFromCsv end-to-end', () => {
-  /** Bring the DB up to schema V2 (staff_name column + GUEST seed) before
-   *  each sales-import test. Without this the sales executor cannot write
-   *  the staff_name column and the GUEST pseudo-member is absent. */
+  /** Bring the DB up to schema V3 (Phase 18 staff_name + GUEST seed, plus
+   *   Phase 19 transaction_items.note). Without these the sales executor
+   *   cannot write the staff_name or note columns, and the GUEST pseudo-member
+   *   is absent. Migrations run in order since V3 assumes V2 has been applied. */
   beforeEach(() => {
     globalThis.migrations[2]();
+    globalThis.migrations[3]();
   });
 
   /** Seed helpers so tests start from a known member / product / payment baseline. */
@@ -1130,11 +1132,11 @@ describe('Phase 18: syncSalesFromCsv end-to-end', () => {
     expect(items[0].n).toBe(2);
   });
 
-  it('merges SaaS-authoritative fields on an existing (date, member) transaction without overwriting attendance', async () => {
+  it('Phase 19: merges SaaS-authoritative fields and preserves local transaction memo on paid rows', async () => {
     seedMembers();
     seedSalesPaymentMethods();
 
-    /** Pre-existing local transaction: attendance is 1, received is 0, no staff_name */
+    /** Pre-existing local transaction: attendance is 1, received is 0, a local memo */
     insertTransaction({
       date: '2026-04-18',
       member_id: 'T-0001',
@@ -1153,15 +1155,26 @@ describe('Phase 18: syncSalesFromCsv end-to-end', () => {
     expect(result.updatedTxns).toBe(1);
     expect(result.addedItems).toBe(1);
 
-    /** is_attended stays untouched (not SaaS-authoritative); is_received is now 1;
-     *  staff_name and memo are now from the CSV. */
+    /** Phase 19 semantics:
+     *   - is_received flips to 1 (SaaS authoritative)
+     *   - is_attended is set to 1 by the paid row (was already 1; unchanged net effect)
+     *   - staff_name comes from CSV
+     *   - memo is NOT touched by the sales import; the local 'reception note' is preserved
+     *   - the CSV remark lands on transaction_items.note per-row, not on the transaction memo */
     const txn = globalThis.dbGetOne(
       "SELECT is_attended, is_received, staff_name, memo FROM transactions WHERE member_id = 'T-0001' AND date = '2026-04-18'"
     );
     expect(txn.is_attended).toBe(1);
     expect(txn.is_received).toBe(1);
     expect(txn.staff_name).toBe('平野 智子');
-    expect(txn.memo).toBe('CSV remark | 2026-04-18');
+    expect(txn.memo).toBe('reception note');
+
+    /** Per-item note carries the remark. */
+    const item = globalThis.dbGetOne(
+      `SELECT note FROM transaction_items
+       WHERE transaction_id = (SELECT id FROM transactions WHERE member_id = 'T-0001' AND date = '2026-04-18')`
+    );
+    expect(item.note).toBe('CSV remark');
   });
 
   it('aborts the whole import when two non-temporary members share a normalized name', async () => {
@@ -1232,5 +1245,115 @@ describe('Phase 18: syncSalesFromCsv end-to-end', () => {
     expect(guest).toBeTruthy();
     expect(guest.name).toBe('非会員');
     expect(guest.is_temporary).toBe(1);
+  });
+
+  /** ---------------------- Phase 19 新規テスト ---------------------- */
+
+  it('Phase 19: creates the schema V3 transaction_items.note column via migrations[3]', () => {
+    const cols = globalThis.dbQuery("PRAGMA table_info('transaction_items')");
+    const colNames = cols.map((c) => c.name);
+    expect(colNames).toContain('note');
+  });
+
+  it('Phase 19: paid-row INSERT writes payment, staff, is_received=1, is_attended=1', async () => {
+    seedMembers();
+    seedSalesPaymentMethods();
+
+    const rows = [
+      buildRow('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '平野 智子', '', '')
+    ];
+    await globalThis.syncSalesFromCsv(HEADERS, rows);
+
+    const txn = globalThis.dbGetOne(
+      `SELECT is_received, is_attended, payment_method_id, staff_name, memo
+       FROM transactions WHERE member_id = 'T-0001' AND date = '2026-04-18'`
+    );
+    expect(txn.is_received).toBe(1);
+    expect(txn.is_attended).toBe(1);
+    expect(txn.payment_method_id).not.toBe(null);
+    expect(txn.staff_name).toBe('平野 智子');
+    /** memo is never written from the sales import path */
+    expect(txn.memo).toBe(null);
+  });
+
+  it('Phase 19: unpaid-row INSERT clears payment, staff, is_received=0, is_attended=0 even when CSV defaults them', async () => {
+    seedMembers();
+    seedSalesPaymentMethods();
+
+    /** SaaS exports unpaid rows with a default 現金 payment string and a staff name.
+     *   Phase 19 rule: ignore both. The unpaid row represents a sale that has not
+     *   been settled yet, so recording a payment event here would be wrong. */
+    const rows = [
+      buildRow('未入金', '2026-04-18', '山田 太郎', '振替手数料', '振替手数料', 100, '現金', 'ダミー担当', '', '')
+    ];
+    await globalThis.syncSalesFromCsv(HEADERS, rows);
+
+    const txn = globalThis.dbGetOne(
+      `SELECT is_received, is_attended, payment_method_id, staff_name
+       FROM transactions WHERE member_id = 'T-0001' AND date = '2026-04-18'`
+    );
+    expect(txn.is_received).toBe(0);
+    expect(txn.is_attended).toBe(0);
+    expect(txn.payment_method_id).toBe(null);
+    expect(txn.staff_name).toBe(null);
+  });
+
+  it('Phase 19: note dedup keeps two rows with same product and price but different remarks', async () => {
+    seedMembers();
+    seedSalesPaymentMethods();
+
+    /** Two items with identical product name ("テニス 商品") and same price (4455)
+     *   but different remarks. Phase 18 would collapse them into one via a 2-tuple
+     *   dedup key; Phase 19 keeps both via the (product, price, note) 3-tuple key. */
+    const rows = [
+      buildRow('入金済', '2026-04-18', '山田 太郎', 'テニス 商品', '販売商品', 4455, 'ステラ', '野開', '', 'コキュージュニアラケット'),
+      buildRow('入金済', '2026-04-18', '山田 太郎', 'テニス 商品', '販売商品', 4455, 'ステラ', '野開', '', 'ヨネックスジュニアシューズ')
+    ];
+    const first = await globalThis.syncSalesFromCsv(HEADERS, rows);
+    expect(first.addedItems).toBe(2);
+    expect(first.skippedDupItems).toBe(0);
+
+    const items = globalThis.dbQuery(
+      `SELECT product_name_snapshot, price_snapshot, note
+       FROM transaction_items ORDER BY id ASC`
+    );
+    expect(items).toHaveLength(2);
+    const notes = items.map((i) => i.note).sort();
+    expect(notes).toEqual(['コキュージュニアラケット', 'ヨネックスジュニアシューズ']);
+
+    /** Re-import: the 3-tuple key matches both, so nothing is added the second time. */
+    const second = await globalThis.syncSalesFromCsv(HEADERS, rows);
+    expect(second.addedItems).toBe(0);
+    expect(second.skippedDupItems).toBe(2);
+
+    const itemsAfterRerun = globalThis.dbQuery('SELECT COUNT(*) AS n FROM transaction_items');
+    expect(itemsAfterRerun[0].n).toBe(2);
+  });
+
+  it('Phase 19: paid UPDATE on an existing unpaid transaction flips is_attended to 1', async () => {
+    seedMembers();
+    seedSalesPaymentMethods();
+
+    /** Pre-existing local transaction with attendance=0 and received=0 (for example
+     *   a reservation that was imported earlier and has not been settled yet). */
+    insertTransaction({
+      date: '2026-04-18',
+      member_id: 'T-0001',
+      member_name_snapshot: '山田 太郎',
+      is_attended: 0,
+      is_received: 0
+    });
+
+    const rows = [
+      buildRow('入金済', '2026-04-18', '山田 太郎', '体験レッスン', '販売商品', 1100, '現金/スマホ', '平野', '', '')
+    ];
+    const result = await globalThis.syncSalesFromCsv(HEADERS, rows);
+    expect(result.updatedTxns).toBe(1);
+
+    const txn = globalThis.dbGetOne(
+      "SELECT is_received, is_attended FROM transactions WHERE member_id = 'T-0001' AND date = '2026-04-18'"
+    );
+    expect(txn.is_received).toBe(1);
+    expect(txn.is_attended).toBe(1);
   });
 });

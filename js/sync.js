@@ -693,17 +693,25 @@ async function syncReservationsFromCsv(headers, rows, targetDate) {
 // ============================================
 
 /**
- * 売上明細CSVの支払方法エイリアス。
+ * 売上明細CSVの支払方法エイリアス（Phase 19 で確定版に整理）。
  * SaaS（HiTouch）が吐き出す文字列揺れを吸収し、payment_methods.name に解決するためのマップ。
  * 各エントリは [canonical, [aliases...]] 形式で、aliases に含まれる（正規化後の）文字列が来たら
  * canonical 名を payment_methods.name と照合する。
- * 現状 3 択（現金/スマホ, ステラ, PayPay）。payment_methods に実際に登録されている行に合わせて
- * 運用する必要があるため、未解決のときはユーザー側でCSVを使って別途取り込む前提。
+ *
+ * 運用確定の 4 種:
+ *   - 現金: 通常の現金決済
+ *   - 現金・スマホ: スマホ決済込みの POS ラベル（中点・/スラッシュ両形式を alias で受け入れる）
+ *   - PayPay: PayPay 単独決済
+ *   - ステラ: クレジットカード決済端末（ステラ）
+ *
+ * payment_methods マスタに該当行が無い場合は未解決としてサマリに計上。決済方法の登録・管理は
+ * 別系統の payment-methods CSV 取り込みで行う（売上明細からは自動作成しない）。
  */
 const SALES_PAYMENT_METHOD_ALIASES = [
-  ['現金/スマホ', ['現金/スマホ', '現金・スマホ', '現金スマホ', '現金', 'cash', '現金・スマ', '現金/スマ']],
-  ['ステラ', ['ステラ', 'stella']],
-  ['PayPay', ['PayPay', 'paypay', 'ペイペイ', 'Paypay', 'PAYPAY']]
+  ['現金', ['現金', 'cash', 'CASH', 'Cash']],
+  ['現金・スマホ', ['現金・スマホ', '現金/スマホ', '現金スマホ', '現金・スマ', '現金/スマ', '現金・スマートフォン', '現金スマ']],
+  ['PayPay', ['PayPay', 'paypay', 'ペイペイ', 'Paypay', 'PAYPAY']],
+  ['ステラ', ['ステラ', 'stella', 'Stella', 'STELLA']]
 ];
 
 /**
@@ -911,8 +919,14 @@ function classifySalesRows(rows, columnMap, ctx) {
       continue;
     }
 
-    /** ステータス → is_received（入金済 のみ 1、それ以外は 0） */
-    const isReceived = String(rawStatus).includes('入金済') ? 1 : 0;
+    /** Phase 19: ステータス駆動でトランザクション権威フィールドを決める。
+     *   入金済 → is_received=1, is_attended=1, payment_method_id を解決, staff_name を採用
+     *   未入金 → is_received=0, is_attended=0, payment_method_id=null, staff_name=null
+     *   未入金行の支払方法と担当者 CSV 値は無視する（SaaS が未入金時も「現金」を
+     *   デフォルトで埋めてくるため、額面通りに採用すると発生していない決済イベントを記録してしまう）。 */
+    const isPaid = String(rawStatus).includes('入金済');
+    const isReceived = isPaid ? 1 : 0;
+    const isAttended = isPaid ? 1 : 0;
 
     /** 会員解決 */
     const normMemberName = normalizeSalesName(rawMemberName);
@@ -972,25 +986,27 @@ function classifySalesRows(rows, columnMap, ctx) {
       productNameCache.set(normProdName, productCode);
     }
 
-    /** 支払方法解決 */
+    /** Phase 19: 支払方法と担当者は「入金済行のみ」が真の情報源。
+     *   未入金行では rawPaymentMethod / rawStaffName を一切見ない。 */
     let paymentMethodId = null;
-    if (rawPaymentMethod) {
-      const pm = resolveSalesPaymentMethod(rawPaymentMethod, ctx.paymentsByKey);
-      if (pm) {
-        paymentMethodId = pm.id;
-      } else {
-        unresolvedPaymentCount++;
-        unresolvedPaymentLabels.push(rawPaymentMethod);
+    let staffName = null;
+    if (isPaid) {
+      if (rawPaymentMethod) {
+        const pm = resolveSalesPaymentMethod(rawPaymentMethod, ctx.paymentsByKey);
+        if (pm) {
+          paymentMethodId = pm.id;
+        } else {
+          unresolvedPaymentCount++;
+          unresolvedPaymentLabels.push(rawPaymentMethod);
+        }
       }
+      staffName = rawStaffName || null;
     }
 
-    /** memo 合成: 備考 | 入金/返金マーカー（パイプ区切り） */
-    const memoParts = [];
-    if (rawRemark) memoParts.push(rawRemark);
-    if (rawPayRefund) memoParts.push(rawPayRefund);
-    const composedMemo = memoParts.length > 0 ? memoParts.join(' | ') : null;
-
-    const staffName = rawStaffName || null;
+    /** Phase 19: 入金/返金列は一切無視する（現状の要件では DB に保存しない）。
+     *   備考は per-item の note としてあとで item 行に積む。
+     *   transactions.memo は CSV からは一切書き込まない（ローカルで reception が書いたメモを保護する）。 */
+    const itemNote = rawRemark || null;
 
     /** (date, memberId) バケットへ寄せる */
     const bucketKey = `${date}|${memberId}`;
@@ -1001,29 +1017,29 @@ function classifySalesRows(rows, columnMap, ctx) {
         memberId,
         memberNameSnapshot,
         isReceived,
+        isAttended,
         paymentMethodId,
         staffName,
-        memo: composedMemo,
         items: []
       };
       txnBuckets.set(bucketKey, bucket);
     } else {
-      /** 複数行で「入金済」「未入金」が混ざった場合は、入金済を優先して代表値にする。
-       *  payment_method_id も入金済側の値を採用することで整合を保つ。 */
-      if (isReceived === 1 && bucket.isReceived === 0) {
+      /** Phase 19: 入金済行がバケットに合流したら、トランザクション権威フィールドを
+       *   まとめて入金済側の値に昇格させる。未入金行が追加で来ても、既に入金済に
+       *   引き上がったバケットの状態は維持する（下降しない）。 */
+      if (isPaid && bucket.isReceived === 0) {
         bucket.isReceived = 1;
+        bucket.isAttended = 1;
         bucket.paymentMethodId = paymentMethodId;
+        bucket.staffName = staffName;
       }
-      /** staff_name は先勝ち。異なる staff が混ざっても上書きしない（plan 上の first-write-wins ルール） */
-      if (!bucket.staffName && staffName) bucket.staffName = staffName;
-      /** memo は既存値があれば維持。同一取引で複数行が備考を持っていたら先勝ち */
-      if (!bucket.memo && composedMemo) bucket.memo = composedMemo;
     }
 
     bucket.items.push({
       productCode,
       productName: rawItemDesc,
-      price: amount
+      price: amount,
+      note: itemNote
     });
   }
 
@@ -1156,8 +1172,11 @@ async function syncSalesFromCsv(headers, rows) {
   const itemKeysByTxnId = new Map();
   for (const it of existingItems) {
     if (!itemKeysByTxnId.has(it.transaction_id)) itemKeysByTxnId.set(it.transaction_id, new Set());
+    /** Phase 19: 3つ組キー normalized(product_name) | price | normalized(note)
+     *   同じ商品・同じ金額でも備考が違えば別明細として扱う（画像の行11/12のような
+     *   「テニス 商品」+ 異なる備考 のケースを保持するため）。 */
     itemKeysByTxnId.get(it.transaction_id).add(
-      `${normalizeSalesName(it.product_name_snapshot)}|${Number(it.price_snapshot)}`
+      `${normalizeSalesName(it.product_name_snapshot)}|${Number(it.price_snapshot)}|${normalizeSalesName(it.note || '')}`
     );
   }
 
@@ -1198,39 +1217,42 @@ async function syncSalesFromCsv(headers, rows) {
     for (const bucket of plan.txnBuckets.values()) {
       let txnId = bucket.existingTxnId;
       if (!txnId) {
+        /** Phase 19: INSERT に is_attended を含める。memo は常に NULL（CSV から txn.memo を書かない）。 */
         await dbRun(
           `INSERT INTO transactions
            (date, member_id, member_name_snapshot, payment_method_id, is_attended, is_received, memo, staff_name, created_at, updated_at)
-           VALUES (?, ?, ?, ?, 0, ?, ?, ?, ?, ?)`,
-          [bucket.date, bucket.memberId, bucket.memberNameSnapshot, bucket.paymentMethodId, bucket.isReceived, bucket.memo, bucket.staffName, now, now]
+           VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)`,
+          [bucket.date, bucket.memberId, bucket.memberNameSnapshot, bucket.paymentMethodId, bucket.isAttended, bucket.isReceived, bucket.staffName, now, now]
         );
         const lastIdRow = dbGetOne('SELECT last_insert_rowid() AS id');
         txnId = lastIdRow.id;
         addedTxns++;
       } else {
-        /** 既存 txn の SaaS 権威フィールドのみ更新（is_received / payment_method_id / staff_name / memo） */
+        /** Phase 19: 既存 txn 更新は SaaS 権威 4 フィールド（is_received / is_attended / payment_method_id / staff_name）のみ。
+         *   memo は触らない（ローカルで reception が書いたメモを保護）。 */
         await dbRun(
           `UPDATE transactions
-           SET is_received = ?, payment_method_id = ?, staff_name = ?, memo = ?, updated_at = ?
+           SET is_received = ?, is_attended = ?, payment_method_id = ?, staff_name = ?, updated_at = ?
            WHERE id = ?`,
-          [bucket.isReceived, bucket.paymentMethodId, bucket.staffName, bucket.memo, now, txnId]
+          [bucket.isReceived, bucket.isAttended, bucket.paymentMethodId, bucket.staffName, now, txnId]
         );
         updatedTxns++;
       }
 
-      /** 明細挿入（重複キー検知） */
+      /** 明細挿入（重複キー検知、Phase 19: 3つ組キー） */
       const knownKeys = new Set(bucket.existingItemKeys);
       for (const item of bucket.items) {
-        const key = `${normalizeSalesName(item.productName)}|${Number(item.price)}`;
+        const key = `${normalizeSalesName(item.productName)}|${Number(item.price)}|${normalizeSalesName(item.note || '')}`;
         if (knownKeys.has(key)) {
           skippedDupItems++;
           continue;
         }
+        /** Phase 19: INSERT に note カラムを含める */
         await dbRun(
           `INSERT INTO transaction_items
-           (transaction_id, product_code, product_name_snapshot, price_snapshot, quantity)
-           VALUES (?, ?, ?, ?, 1)`,
-          [txnId, item.productCode, item.productName, item.price]
+           (transaction_id, product_code, product_name_snapshot, price_snapshot, quantity, note)
+           VALUES (?, ?, ?, ?, 1, ?)`,
+          [txnId, item.productCode, item.productName, item.price, item.note || null]
         );
         knownKeys.add(key);
         addedItems++;

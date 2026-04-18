@@ -107,8 +107,10 @@ function getExistingTxnsAndItemsForSales(pairs) {
   if (txns.length === 0) return { txns, items: [] };
   const txnIds = txns.map((t) => t.id);
   const itemPlaceholders = txnIds.map(() => '?').join(',');
+  /** Phase 19: note も取得して三つ組 dedup キーに使えるようにする。
+   *   V3 migration 適用前の既存行では NULL なので、呼び出し側で NULL を空文字に正規化して比較する。 */
   const items = dbQuery(
-    `SELECT transaction_id, product_name_snapshot, price_snapshot
+    `SELECT transaction_id, product_name_snapshot, price_snapshot, note
      FROM transaction_items WHERE transaction_id IN (${itemPlaceholders})`,
     txnIds
   );

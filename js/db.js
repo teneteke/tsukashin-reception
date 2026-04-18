@@ -16,7 +16,7 @@ const OPFS_DB_FILENAME = 'tsukashin.sqlite';
 const BROADCAST_CHANNEL_NAME = 'tsukashin-app';
 
 /** 現在のスキーマバージョン */
-const CURRENT_SCHEMA_VERSION = 2;
+const CURRENT_SCHEMA_VERSION = 3;
 
 /** 非会員（SaaS売上明細CSVの「非会員」行）を集約する固定擬似会員のID。
  *  W- プレフィックス（walk-in）と重ならない別プレフィックスを使う。
@@ -630,6 +630,21 @@ const migrations = {
     );
 
     console.log('マイグレーション: V1 → V2 完了（staff_name 追加 + GUEST擬似会員シード）');
+  },
+
+  /**
+   * V3: Phase 19 売上明細CSVの行単位 note を保持するカラムを transaction_items に追加。
+   *   備考列は (date, member_id) 単位の memo ではなく、明細ごとに保存すべき粒度（同一会員・同一日で
+   *   行ごとに備考が異なる実データが確認されたため）。ALTER TABLE は冪等ではないので
+   *   PRAGMA table_info で存在チェックしてから実行する。
+   */
+  3: function migrateV2toV3() {
+    const columns = dbQuery("PRAGMA table_info('transaction_items')");
+    const hasNote = columns.some((col) => col.name === 'note');
+    if (!hasNote) {
+      db.run('ALTER TABLE transaction_items ADD COLUMN note TEXT');
+    }
+    console.log('マイグレーション: V2 → V3 完了（transaction_items.note 追加）');
   }
 };
 
